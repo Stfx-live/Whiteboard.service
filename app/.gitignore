@@ -1,0 +1,6 @@
+node_modules/
+data/accounts.json
+data/audit.log
+data/boards/
+data/uploads/
+*.log

@@ -1,0 +1,6 @@
+Whiteboard Setup v53 -> v54
+1. Zip entpacken. 2. Windows: Doppelklick auf Setup.bat (Linux/Mac: ./Setup.sh)
+3. Ordner der alten v53-Installation angeben.
+Das Setup sichert "data" (Konten, Boards, Uploads) in einen Ordner "<Installation>_backup_<Zeit>",
+loescht die alte Version (ausser data), kopiert v54, fuehrt npm install und npm run build aus.
+Voraussetzung: Node.js (nodejs.org). Start danach: npm start -> http://localhost:8080
