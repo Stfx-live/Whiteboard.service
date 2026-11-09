@@ -13,6 +13,8 @@ import {
 import { drawObject, drawBackground, drawSelection, strokePath, preloadImages, isDarkColor, getImage } from "../lib/render";
 import { createHistory, pushHistory, undoHistory, redoHistory } from "../lib/undoRedo";
 import { contentBounds, exportPng, exportJson, buildPdf, renderExportCanvas } from "../lib/export";
+import { inRect, boxInRect, clampTo, zoneBox, unionRect, drawZoneFills, drawZoneFrames, ZONE_MODES } from "../lib/zones";
+import ZonesPanel from "./ZonesPanel";
 
 const DEFAULT_BG = { color: "#ffffff", pattern: "grid", size: 24 };
 const TOOLS = [
@@ -41,6 +43,8 @@ const fontFromWidth = w => Math.round(Math.max(16, Math.min(120, 12 + w * 5)));
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 const isTyping = t => t instanceof HTMLInputElement || t instanceof HTMLTextAreaElement || t instanceof HTMLSelectElement || t?.isContentEditable;
 const DRAW_TOOLS = new Set(["pen", "marker", "eraser", "line", "arrow", "rect", "circle", "text"]);
+const ZONE_TOOL = { id: "zone", icon: "zone", label: "Bereich", key: "B" };
+const NO_SCOPE = { restricted: false, seeAll: true, writableIds: [] };
 
 // Entfernte Cursor: eigener kleiner Store, damit 25 Hz Cursor-Updates nicht die ganze Board-Ansicht neu rendern.
 function useCursorStore() {
@@ -90,7 +94,12 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const [dragging, setDragging] = useState(false);
   const [view, setViewState] = useState({ zoom: 1, pan: { x: 0, y: 0 } });
   const [participants, setParticipants] = useState([]);
-  const [readOnly, setReadOnly] = useState(isGuest && guest?.guest?.mode === "view-only");
+  const [serverRO, setReadOnly] = useState(isGuest && guest?.guest?.mode === "view-only");
+  const [zones, setZones] = useState([]);
+  const [zoneScope, setZoneScope] = useState(NO_SCOPE);
+  const [selZone, setSelZoneState] = useState(null);
+  const [zonePanel, setZonePanel] = useState(false);
+  const [candidates, setCandidates] = useState([]);
   const [allowDeleteOthers, setAllowDeleteOthers] = useState(false);
   const [viewSyncEnabled, setViewSyncEnabled] = useState(false);
   const [popover, setPopover] = useState(null); // "bg" | "export" | "people" | null
@@ -120,6 +129,10 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const clipboard = useRef([]), pasteCount = useRef(0), localClear = useRef(false);
   const selectedRef = useRef([]), textEditRef = useRef(null), liveTimer = useRef(null);
   const cursors = useCursorStore();
+  const zoneOv = useRef(null), zoneToastAt = useRef(0), zoneSigRef = useRef("");
+  const zoneRO = zoneScope.restricted && zoneScope.writableIds.length === 0;
+  const readOnly = serverRO || zoneRO;
+  const writableZones = zoneScope.restricted ? zones.filter(z => zoneScope.writableIds.includes(z.id)) : null;
   const exitRef = useRef(onExit); exitRef.current = onExit;
   const fns = useRef({});
 
@@ -129,7 +142,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
 
   // Aktueller Stand für Event-Handler (wird bei jedem Render aktualisiert → keine veralteten Closures).
   const S = useRef({});
-  S.current = { strokes, bg, tool, color, width, fill, pencilMode, readOnly, viewLocked, isAdmin, allowDeleteOthers, identityId, viewSyncEnabled, selectedIds, hiddenId: textEdit?.id || null, theme };
+  S.current = { strokes, bg, tool, color, width, fill, pencilMode, readOnly, serverRO, zones, zoneScope, wz: writableZones, selZone, viewLocked, isAdmin, allowDeleteOthers, identityId, viewSyncEnabled, selectedIds, hiddenId: textEdit?.id || null, theme };
 
   /* ───────────── Zeichenfläche: Frame-Rendering ───────────── */
   function scheduleFrame() { if (frame.current) return; frame.current = requestAnimationFrame(renderFrame); }
@@ -151,6 +164,8 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const m = 8 / v.zoom;
     const vr = { left: -v.pan.x / v.zoom, top: -v.pan.y / v.zoom, right: (w - v.pan.x) / v.zoom, bottom: (h - v.pan.y) / v.zoom, zoom: v.zoom };
     drawBackground(x, st.bg, vr);
+    const zov = zoneOv.current, zl = st.zones.length ? (zov ? st.zones.map(z => z.id === zov.id ? { ...z, ...zov.rect } : z) : st.zones) : st.zones;
+    if (zl.length) drawZoneFills(x, zl);
     const visible = s => { const b = objectBounds(s); return !b || !(b.x - m > vr.right || b.x + b.w + m < vr.left || b.y - m > vr.bottom || b.y + b.h + m < vr.top); };
     for (const s0 of st.strokes) {
       if (s0._id === st.hiddenId) continue;
@@ -158,6 +173,14 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       if (visible(s)) drawObject(x, s, { onImageLoad: scheduleFrame });
     }
     remoteLive.current.forEach(s => drawObject(x, s));
+    if (st.zoneScope.restricted) { // Außerhalb der erlaubten Bereiche abdunkeln
+      const keep = st.zoneScope.seeAll ? zl.filter(z => st.zoneScope.writableIds.includes(z.id)) : zl;
+      x.save(); x.beginPath(); x.rect(vr.left - 20, vr.top - 20, vr.right - vr.left + 40, vr.bottom - vr.top + 40);
+      keep.forEach(z => x.rect(z.x, z.y, z.w, z.h));
+      if (st.zoneScope.seeAll) { x.globalAlpha = 0.24; x.fillStyle = isDarkColor(st.bg.color) ? "#000" : "#334155"; } else { x.globalAlpha = 0.94; x.fillStyle = st.bg.color; }
+      x.fill("evenodd"); x.restore();
+    }
+    if (zl.length) drawZoneFrames(x, zl, v.zoom, st.isAdmin ? st.selZone : null);
     x.restore();
 
     const o = ov.getContext("2d");
@@ -168,9 +191,16 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       const items = st.strokes.filter(s => ids.has(s._id)).map(s => over.get(s._id) || s);
       if (items.length) drawSelection(o, items, v);
     }
+    if (st.isAdmin && st.tool === "zone" && st.selZone) {
+      const z = zl.find(q => q.id === st.selZone);
+      if (z) { o.save(); o.fillStyle = "#fff"; o.strokeStyle = z.color; o.lineWidth = 2; for (const [hx, hy] of [[z.x, z.y], [z.x + z.w, z.y], [z.x, z.y + z.h], [z.x + z.w, z.y + z.h]]) { const sx = hx * v.zoom + v.pan.x, sy = hy * v.zoom + v.pan.y; o.beginPath(); o.rect(sx - 6, sy - 6, 12, 12); o.fill(); o.stroke(); } o.restore(); }
+    }
     if (a) {
       o.save(); o.translate(v.pan.x, v.pan.y); o.scale(v.zoom, v.zoom);
-      if (a.kind === "draw") {
+      if (a.kind === "zonenew") {
+        const r = { x: Math.min(a.a.x, a.p.x), y: Math.min(a.a.y, a.p.y), w: Math.abs(a.p.x - a.a.x), h: Math.abs(a.p.y - a.a.y) };
+        o.fillStyle = "rgba(99,102,241,.12)"; o.strokeStyle = "#6366f1"; o.lineWidth = 2 / v.zoom; o.setLineDash([9 / v.zoom, 6 / v.zoom]); o.fillRect(r.x, r.y, r.w, r.h); o.strokeRect(r.x, r.y, r.w, r.h);
+      } else if (a.kind === "draw") {
         o.strokeStyle = st.color; o.lineWidth = a.tool === "marker" ? markerWidth(st.width) : st.width; o.lineCap = "round"; o.lineJoin = "round"; o.fillStyle = st.color;
         if (a.tool === "marker") o.globalAlpha = 0.38;
         if (a.pts.length === 1) { o.beginPath(); o.arc(a.pts[0].x, a.pts[0].y, o.lineWidth / 2, 0, Math.PI * 2); o.fill(); } else { strokePath(o, a.pts); o.stroke(); }
@@ -199,6 +229,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       if (a.tool === "line" || a.tool === "arrow") { const ang = Math.round(Math.atan2(p.y - q.y, p.x - q.x) / (Math.PI / 12)) * (Math.PI / 12), len = Math.hypot(p.x - q.x, p.y - q.y); ex = q.x + Math.cos(ang) * len; ey = q.y + Math.sin(ang) * len; }
       else { const side = Math.max(Math.abs(p.x - q.x), Math.abs(p.y - q.y)); ex = q.x + Math.sign(p.x - q.x || 1) * side; ey = q.y + Math.sign(p.y - q.y || 1) * side; }
     }
+    if (a.zone) { const c = clampTo(a.zone, { x: ex, y: ey }); ex = c.x; ey = c.y; }
     if (Math.hypot(ex - q.x, ey - q.y) < 1.5 / viewRef.current.zoom) return null;
     if (a.tool === "line" || a.tool === "arrow") return { type: a.tool, x1: q.x, y1: q.y, x2: ex, y2: ey, color: st.color, width: st.width };
     return { type: a.tool, x: q.x, y: q.y, w: ex - q.x, h: ey - q.y, color: st.color, width: st.width, ...(st.fill ? { fill: true } : {}) };
@@ -248,6 +279,13 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const z = clamp(Math.min(r.width / b.w, r.height / b.h, 2), ZOOM_MIN, ZOOM_MAX);
     animateView({ zoom: z, pan: { x: r.width / 2 - (b.x + b.w / 2) * z, y: r.height / 2 - (b.y + b.h / 2) * z } });
   }
+  function focusRect(r, ms = 340) {
+    if (!r || S.current.viewLocked) return;
+    const el = stackRef.current; if (!el) return;
+    const b = el.getBoundingClientRect(); if (!b.width) return;
+    const z = clamp(Math.min((b.width - 90) / r.w, (b.height - 190) / r.h, 2), ZOOM_MIN, ZOOM_MAX);
+    animateView({ zoom: z, pan: { x: b.width / 2 - (r.x + r.w / 2) * z, y: b.height / 2 - (r.y + r.h / 2) * z + 10 } }, ms);
+  }
   function applySharedView(payload, ms = 90) {
     const z = clamp(Number(payload?.zoom) || 1, ZOOM_MIN, ZOOM_MAX), r = stackRef.current?.getBoundingClientRect();
     const c = payload?.center && Number.isFinite(Number(payload.center.x)) && Number.isFinite(Number(payload.center.y)) ? { x: Number(payload.center.x), y: Number(payload.center.y) } : null;
@@ -263,10 +301,15 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const syncUndo = () => { setCanUndo(historyRef.current.past.length > 0); setCanRedo(historyRef.current.future.length > 0); };
   function setSel(ids) { selectedRef.current = ids; setSelectedIdsState(ids); scheduleFrame(); }
   function setTextEdit(v) { textEditRef.current = v; setTextEditState(v); }
-  const canDelete = a => S.current.isAdmin || S.current.allowDeleteOthers || !a.ownerId || a.ownerId === S.current.identityId;
+  const canWriteItem = s => { const wz = S.current.wz; if (!wz) return true; const b = zoneBox(s); return wz.some(z => boxInRect(z, b)); };
+  const canDelete = a => (S.current.isAdmin || S.current.allowDeleteOthers || !a.ownerId || a.ownerId === S.current.identityId) && canWriteItem(a);
+  const zoneAt = p => S.current.wz ? S.current.wz.find(z => inRect(z, p, 0.5)) || null : null;
+  function denyZone(msg) { const n = performance.now(); if (n - zoneToastAt.current > 1800) { zoneToastAt.current = n; toast(msg || "Hier darfst du nicht schreiben – nur innerhalb deines Bereichs.", "error", 2300); } }
+  const setSelZone = id => { setSelZoneState(id); scheduleFrame(); };
 
   function addObjects(items, { history = true, select = false, event = "draw-batch" } = {}) {
     if (!items.length || S.current.readOnly) return [];
+    if (S.current.wz) { const okItems = items.filter(canWriteItem); if (okItems.length < items.length) denyZone("Das passt nicht in deinen Bereich – es muss komplett hineinpassen."); items = okItems; if (!items.length) return []; }
     const owned = items.map(it => ({ ...it, _id: it._id || uid(), ownerId: S.current.identityId }));
     owned.forEach(o => committedIds.current.add(o._id));
     setStrokes(v => [...v, ...owned]);
@@ -291,6 +334,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const getSelected = () => { const ids = new Set(selectedRef.current); return S.current.strokes.filter(s => ids.has(s._id)); };
   function changeStates(items, make) { // Änderung mit Undo-Eintrag
     const before = items.map(s => ({ id: s._id, state: s })), after = items.map(s => ({ id: s._id, state: make(s) }));
+    if (S.current.wz && after.some(i => !canWriteItem(i.state))) { denyZone("Das würde den Bereich verlassen – verschieben ist nur innerhalb möglich."); return; }
     pushHistory(historyRef.current, { kind: "transform", before, after }); syncUndo(); applyStates(after);
   }
   function deleteSelection() { const sel = getSelected(); const del = sel.filter(canDelete); if (sel.length && !del.length) toast("Du darfst diese Objekte nicht löschen.", "error"); removeObjects(del); }
@@ -326,9 +370,9 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     pushHistory(historyRef.current, { kind: "clear", strokes: S.current.strokes.slice() }); syncUndo();
     localClear.current = true; setStrokes([]); setSel([]); send("clear-board", boardId);
   }
-  function chooseBg(item) { if (S.current.readOnly) return; const next = { color: item[1], pattern: item[2], size: item[3] }; setBg(next); send("set-background", { boardId, background: next }); }
-  function updateBg(patch) { if (S.current.readOnly) return; const next = { ...S.current.bg, ...patch }; setBg(next); send("set-background", { boardId, background: next }); }
-  function chooseTool(next) { if (S.current.readOnly && next !== "hand") return; cancelAct(); if (textEditRef.current) commitText(); setTool(next); if (next !== "select" && next !== "lasso" && next !== "hand") setSel([]); }
+  function chooseBg(item) { if (S.current.readOnly || S.current.zoneScope.restricted) return; const next = { color: item[1], pattern: item[2], size: item[3] }; setBg(next); send("set-background", { boardId, background: next }); }
+  function updateBg(patch) { if (S.current.readOnly || S.current.zoneScope.restricted) return; const next = { ...S.current.bg, ...patch }; setBg(next); send("set-background", { boardId, background: next }); }
+  function chooseTool(next) { if (S.current.readOnly && next !== "hand") return; if (next === "zone" && !S.current.isAdmin) return; cancelAct(); if (textEditRef.current) commitText(); setTool(next); if (next !== "select" && next !== "lasso" && next !== "hand") setSel([]); }
 
   /* ───────────── Text ───────────── */
   function openTextEditor(p, existing) {
@@ -358,13 +402,14 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   /* ───────────── Zeiger-Interaktion ───────────── */
   function topHit(p, tol) {
     const list = S.current.strokes;
-    for (let i = list.length - 1; i >= 0; i--) if (hitPoint(list[i], p, tol)) return list[i];
+    for (let i = list.length - 1; i >= 0; i--) if (hitPoint(list[i], p, tol) && canWriteItem(list[i])) return list[i];
     return null;
   }
   function cancelAct() {
     const a = act.current; if (!a) return;
     if (a.kind === "draw" && a.tool !== "eraser") send("stroke-live-cancel", { boardId, _id: a.id });
     if (a.kind === "transform") { override.current.clear(); setDragging(false); }
+    if (a.kind === "zonedrag") { zoneOv.current = null; }
     if (a.kind === "erase") flushErase(true);
     act.current = null; clearTimeout(liveTimer.current); liveTimer.current = null; scheduleFrame();
   }
@@ -408,6 +453,22 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     return true;
   }
   function computeTransform(a, p, shift) {
+    const wz = S.current.wz;
+    if (!wz) return computeTransformRaw(a, p, shift);
+    const zoneFor = new Map(); a.originals.forEach((s, id) => { const b = zoneBox(s); zoneFor.set(id, wz.find(z => boxInRect(z, b)) || null); });
+    if (a.mode === "move") {
+      let dx = p.x - a.start.x, dy = p.y - a.start.y;
+      if (shift) { if (Math.abs(dx) > Math.abs(dy)) dy = 0; else dx = 0; }
+      let loX = -Infinity, hiX = Infinity, loY = -Infinity, hiY = Infinity, free = false;
+      a.originals.forEach((s, id) => { const z = zoneFor.get(id); if (!z) { free = true; return; } const b = zoneBox(s); loX = Math.max(loX, z.x - b.x); hiX = Math.min(hiX, z.x + z.w - (b.x + b.w)); loY = Math.max(loY, z.y - b.y); hiY = Math.min(hiY, z.y + z.h - (b.y + b.h)); });
+      if (!free) { dx = loX <= hiX ? clamp(dx, loX, hiX) : 0; dy = loY <= hiY ? clamp(dy, loY, hiY) : 0; }
+      return computeTransformRaw(a, { x: a.start.x + dx, y: a.start.y + dy }, false);
+    }
+    const out = computeTransformRaw(a, p, shift);
+    if (out.every(i => { const z = zoneFor.get(i.id); return !z || boxInRect(z, zoneBox(i.state)); })) { a.lastOut = out; return out; }
+    return a.lastOut || [...a.originals].map(([id, state]) => ({ id, state }));
+  }
+  function computeTransformRaw(a, p, shift) {
     const out = [];
     if (a.mode === "move") {
       let dx = p.x - a.start.x, dy = p.y - a.start.y;
@@ -463,7 +524,18 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     if (panning) { if (!st.viewLocked) startPan(e); return; }
     const p = point(e), touch = e.pointerType === "touch";
     switch (st.tool) {
+      case "zone": {
+        if (!st.isAdmin) return;
+        try { overlayRef.current.setPointerCapture(e.pointerId); } catch {}
+        const sz = st.zones.find(z => z.id === st.selZone), pad = (touch ? 24 : 12) / viewRef.current.zoom;
+        if (sz) for (const [n, hx, hy] of [["nw", sz.x, sz.y], ["ne", sz.x + sz.w, sz.y], ["sw", sz.x, sz.y + sz.h], ["se", sz.x + sz.w, sz.y + sz.h]]) if (Math.hypot(p.x - hx, p.y - hy) <= pad) { act.current = { kind: "zonedrag", id: e.pointerId, mode: `resize-${n}`, zone: sz, start: p, orig: { x: sz.x, y: sz.y, w: sz.w, h: sz.h }, moved: false }; return; }
+        const hit = st.zones.filter(z => inRect(z, p)).sort((m, n) => m.w * m.h - n.w * n.h)[0];
+        if (hit) { setSelZone(hit.id); act.current = { kind: "zonedrag", id: e.pointerId, mode: "move", zone: hit, start: p, orig: { x: hit.x, y: hit.y, w: hit.w, h: hit.h }, moved: false }; }
+        else { setSelZone(null); act.current = { kind: "zonenew", id: e.pointerId, a: p, p }; }
+        scheduleFrame(); return;
+      }
       case "text": {
+        if (st.wz && !zoneAt(p)) { denyZone(); return; }
         const hit = topHit(p, 6 / viewRef.current.zoom);
         if (hit?.type === "text") { setSel([hit._id]); openTextEditor(p, hit); } else openTextEditor(p, null);
         return;
@@ -493,13 +565,15 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
         const a = { kind: "erase", id: e.pointerId, removed: [], removedIds: new Set(), queue: [], timer: null }; act.current = a; hover.current = p; eraseAt(a, [p]); scheduleFrame(); return;
       }
       case "pen": case "marker": {
+        const zn = st.wz ? zoneAt(p) : null; if (st.wz && !zn) { denyZone(); return; }
         try { overlayRef.current.setPointerCapture(e.pointerId); } catch {}
-        act.current = { kind: "draw", tool: st.tool, id: uid(), pointerId: e.pointerId, pts: [p], sent: 0, lastSent: 0, pointer: e.pointerId };
+        act.current = { kind: "draw", tool: st.tool, id: uid(), pointerId: e.pointerId, zone: zn, pts: [zn ? clampTo(zn, p) : p], sent: 0, lastSent: 0, pointer: e.pointerId };
         flushLive(true); scheduleFrame(); return;
       }
       default: {
+        const zn = st.wz ? zoneAt(p) : null; if (st.wz && !zn) { denyZone(); return; }
         try { overlayRef.current.setPointerCapture(e.pointerId); } catch {}
-        act.current = { kind: "shape", tool: st.tool, pointer: e.pointerId, a: p, p, shift: e.shiftKey }; scheduleFrame();
+        act.current = { kind: "shape", tool: st.tool, pointer: e.pointerId, zone: zn, a: p, p, shift: e.shiftKey }; scheduleFrame();
       }
     }
   }
@@ -523,13 +597,23 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const evs = a.kind === "draw" || a.kind === "erase" || a.kind === "lasso" ? (e.getCoalescedEvents?.() || [e]) : [e];
     if (a.kind === "draw") {
       const minD = 1.1 / viewRef.current.zoom;
-      for (const ev of evs) { const q = point(ev), last = a.pts[a.pts.length - 1]; if (Math.hypot(q.x - last.x, q.y - last.y) >= minD) a.pts.push(q); }
+      for (const ev of evs) { const q0 = point(ev), q = a.zone ? clampTo(a.zone, q0) : q0, last = a.pts[a.pts.length - 1]; if (Math.hypot(q.x - last.x, q.y - last.y) >= minD) a.pts.push(q); }
       scheduleFrame(); flushLive();
     } else if (a.kind === "erase") {
       const qs = evs.map(point); let prev = a.last || qs[0];
       const dense = []; for (const q of qs) { const n = Math.ceil(Math.hypot(q.x - prev.x, q.y - prev.y) / Math.max(2 / viewRef.current.zoom, 1)); for (let i = 1; i <= n; i++) dense.push({ x: prev.x + (q.x - prev.x) * i / n, y: prev.y + (q.y - prev.y) * i / n }); prev = q; }
       a.last = prev; eraseAt(a, dense.length ? dense : qs); scheduleFrame();
-    } else if (a.kind === "shape") { a.p = p; a.shift = e.shiftKey; scheduleFrame(); }
+    } else if (a.kind === "shape") { a.p = a.zone ? clampTo(a.zone, p) : p; a.shift = e.shiftKey; scheduleFrame(); }
+    else if (a.kind === "zonenew") { a.p = p; scheduleFrame(); }
+    else if (a.kind === "zonedrag") {
+      const dx = p.x - a.start.x, dy = p.y - a.start.y, o = a.orig;
+      if (!a.moved && Math.hypot(dx, dy) * viewRef.current.zoom < 3) return;
+      a.moved = true;
+      let rect;
+      if (a.mode === "move") rect = { x: o.x + dx, y: o.y + dy, w: o.w, h: o.h };
+      else { const c = a.mode.slice(7), ax = c.includes("e") ? o.x : o.x + o.w, ay = c.includes("s") ? o.y : o.y + o.h, bx = c.includes("e") ? o.x + o.w + dx : o.x + dx, by = c.includes("s") ? o.y + o.h + dy : o.y + dy; const w = Math.max(40, Math.abs(bx - ax)), h = Math.max(40, Math.abs(by - ay)); rect = { x: bx >= ax ? ax : ax - w, y: by >= ay ? ay : ay - h, w, h }; }
+      zoneOv.current = { id: a.zone.id, rect }; scheduleFrame();
+    }
     else if (a.kind === "marquee") { a.p = p; scheduleFrame(); }
     else if (a.kind === "lasso") { for (const ev of evs) { const q = point(ev), last = a.pts[a.pts.length - 1]; if (Math.hypot(q.x - last.x, q.y - last.y) >= Math.max(1.2, 2 / viewRef.current.zoom)) a.pts.push(q); } scheduleFrame(); }
     else if (a.kind === "transform") {
@@ -553,20 +637,26 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const p = point(e), st = S.current;
     if (a.kind === "draw") {
       clearTimeout(liveTimer.current); liveTimer.current = null;
-      const last = a.pts[a.pts.length - 1]; if (Math.hypot(p.x - last.x, p.y - last.y) > 0.5 / viewRef.current.zoom) a.pts.push(p);
+      const pe = a.zone ? clampTo(a.zone, p) : p, last = a.pts[a.pts.length - 1]; if (Math.hypot(pe.x - last.x, pe.y - last.y) > 0.5 / viewRef.current.zoom) a.pts.push(pe);
       const marker = a.tool === "marker";
       const item = { _id: a.id, type: "stroke", points: a.pts, color: st.color, width: marker ? markerWidth(st.width) : st.width, ...(marker ? { alpha: 0.38 } : {}) };
       addObjects([item], { event: "stroke-commit" });
     } else if (a.kind === "shape") {
-      a.p = p; a.shift = e.shiftKey; const sh = buildShape(a); if (sh) addObjects([sh]);
+      a.p = a.zone ? clampTo(a.zone, p) : p; a.shift = e.shiftKey; const sh = buildShape(a); if (sh) addObjects([sh]);
+    } else if (a.kind === "zonenew") {
+      const r = { x: Math.min(a.a.x, p.x), y: Math.min(a.a.y, p.y), w: Math.abs(p.x - a.a.x), h: Math.abs(p.y - a.a.y) };
+      if (r.w >= 40 && r.h >= 40) zoneCreate(r); else if (r.w > 6 || r.h > 6) toast("Der Bereich ist zu klein – ziehe ihn größer auf.", "info", 1800);
+    } else if (a.kind === "zonedrag") {
+      const rect = zoneOv.current?.rect; zoneOv.current = null;
+      if (a.moved && rect) zoneUpdate(a.zone.id, { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h) });
     } else if (a.kind === "erase") { clearTimeout(a.timer); a.timer = null; flushErase(true); }
     else if (a.kind === "marquee") {
       const box = { x: Math.min(a.a.x, p.x), y: Math.min(a.a.y, p.y), w: Math.abs(p.x - a.a.x), h: Math.abs(p.y - a.a.y) };
       if (box.w < 3 / viewRef.current.zoom && box.h < 3 / viewRef.current.zoom) { if (!a.add) setSel([]); }
-      else { const ids = st.strokes.filter(s => rectsIntersect(objectBounds(s), box)).map(s => s._id); setSel(a.add ? [...new Set([...selectedRef.current, ...ids])] : ids); }
+      else { const ids = st.strokes.filter(s => canWriteItem(s) && rectsIntersect(objectBounds(s), box)).map(s => s._id); setSel(a.add ? [...new Set([...selectedRef.current, ...ids])] : ids); }
     } else if (a.kind === "lasso") {
       const poly = a.pts.slice(); if (poly.length >= 3) poly.push({ ...poly[0] });
-      setSel(poly.length >= 4 ? st.strokes.filter(s => bboxInLasso(objectBounds(s), poly)).map(s => s._id) : []);
+      setSel(poly.length >= 4 ? st.strokes.filter(s => canWriteItem(s) && bboxInLasso(objectBounds(s), poly)).map(s => s._id) : []);
     } else if (a.kind === "transform") {
       const finals = a.moved ? computeTransform(a, p, e.shiftKey) : [];
       override.current.clear(); setDragging(false);
@@ -608,7 +698,10 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   }, []);
 
   // Neu zeichnen, sobald sich sichtbarer Zustand ändert.
-  useEffect(() => { scheduleFrame(); }, [strokes, bg, selectedIds, textEdit?.id, theme, tool, color, width]);
+  useEffect(() => { scheduleFrame(); }, [strokes, bg, selectedIds, textEdit?.id, theme, tool, color, width, zones, zoneScope, selZone]);
+  useEffect(() => { if (selZone && !zones.some(z => z.id === selZone)) setSelZoneState(null); }, [zones, selZone]);
+  useEffect(() => { if (zonePanel && isAdmin) socket.emit("zone:candidates"); }, [zonePanel, zones.length]);
+  useEffect(() => { if (zoneRO && (tool !== "hand")) { cancelAct(); } }, [zoneRO]);
   useEffect(() => () => { [frame, anim, viewSyncTimer].forEach(r => r.current && cancelAnimationFrame(r.current)); clearTimeout(hostTimer.current); clearTimeout(liveTimer.current); }, []);
   useEffect(() => { // Hängengebliebene Live-Striche anderer Teilnehmer aufräumen
     const id = setInterval(() => { const now = performance.now(); let changed = false; remoteLive.current.forEach((s, k) => { if (now - (s.t || 0) > 9000) { remoteLive.current.delete(k); changed = true; } }); if (changed) scheduleFrame(); }, 3000);
@@ -625,6 +718,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const onConnect = () => { setConnected(true); join(); flushOps(); };
     const onDisconnect = () => { setConnected(false); };
     const state = s => {
+      const wasFirst = first.current;
       const next = Array.isArray(s.strokes) ? s.strokes : [];
       committedIds.current = new Set(next.map(x => x?._id).filter(Boolean));
       remoteLive.current.clear(); override.current.clear();
@@ -634,6 +728,15 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       if (first.current) { historyRef.current = createHistory(); syncUndo(); first.current = false; }
       setParticipants(Array.isArray(s.participants) ? s.participants : []);
       setReadOnly(Boolean(s.permissions?.readOnly)); setAllowDeleteOthers(Boolean(s.boardSettings?.allowUserDeleteOthers));
+      const zs = Array.isArray(s.zones) ? s.zones : [], zsc = s.zoneScope?.restricted ? { restricted: true, seeAll: Boolean(s.zoneScope.seeAll), writableIds: Array.isArray(s.zoneScope.writableIds) ? s.zoneScope.writableIds : [] } : NO_SCOPE;
+      setZones(zs); setZoneScope(zsc);
+      const sig = zsc.restricted ? `${zsc.seeAll}|${zs.map(z => `${z.id}:${z.x},${z.y},${z.w},${z.h}`).join("|")}` : "";
+      if (sig !== zoneSigRef.current) {
+        zoneSigRef.current = sig;
+        const focusList = zsc.seeAll ? zs.filter(z => zsc.writableIds.includes(z.id)) : zs, target = unionRect(focusList.length ? focusList : zs);
+        if (zsc.restricted && target) setTimeout(() => fns.current.focusRect(target, wasFirst ? 0 : 380), 80);
+        if (zsc.restricted && !wasFirst) toast("Dein Zugriff wurde vom Admin angepasst.", "info", 2600);
+      }
       const vs = s.viewSync, enabled = Boolean(vs?.enabled); setViewSyncEnabled(enabled);
       if (enabled && !isAdmin) { latestHostSeq.current = Number(vs.seq) || 0; applySharedView(vs, 0); } else if (!enabled) sharedCenter.current = null;
       setLoaded(true);
@@ -689,7 +792,11 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const bgEv = v => setBg(v && typeof v === "object" ? v : DEFAULT_BG);
     const settings = p => setAllowDeleteOthers(Boolean(p?.allowUserDeleteOthers));
     const adminErr = p => toast(p?.message || "Serverfehler", "error");
-    const events = { connect: onConnect, disconnect: onDisconnect, "board-state": state, "room-users": roomUsers, "stroke-live": live, "stroke-live-cancel": cancelLive, "stroke-commit": commitRemote, "draw-batch": drawBatch, erase, "clear-board": clear, "objects-transformed": transformed, "set-background": bgEv, "permission-changed": permission, "board-settings": settings, "view-sync-state": viewSyncState, "host-view": hostView, kicked, "board-access-denied": denied, "board-access-revoked": denied, "board-meta": meta, "board-deleted": gone, "cursor:move": cursor, "file-added": fileAdded, "admin-error": adminErr };
+    const zonesState = p => setZones(Array.isArray(p?.zones) ? p.zones : []);
+    const zoneCreated = p => { if (p?.id) { setSelZoneState(p.id); setZonePanel(true); socket.emit("zone:candidates"); } };
+    const zoneCands = p => setCandidates(Array.isArray(p?.candidates) ? p.candidates : []);
+    const zoneDenied = p => { const ids = new Set(Array.isArray(p?.ids) ? p.ids : []); if (!ids.size) return; ids.forEach(id => committedIds.current.delete(id)); setStrokes(v => v.filter(x => !ids.has(x._id))); setSel(selectedRef.current.filter(i => !ids.has(i))); toast("Außerhalb deines Bereichs – Änderung abgelehnt.", "error", 2400); };
+    const events = { connect: onConnect, disconnect: onDisconnect, "board-state": state, "room-users": roomUsers, "stroke-live": live, "stroke-live-cancel": cancelLive, "stroke-commit": commitRemote, "draw-batch": drawBatch, erase, "clear-board": clear, "objects-transformed": transformed, "set-background": bgEv, "permission-changed": permission, "board-settings": settings, "view-sync-state": viewSyncState, "host-view": hostView, kicked, "board-access-denied": denied, "board-access-revoked": denied, "board-meta": meta, "board-deleted": gone, "cursor:move": cursor, "file-added": fileAdded, "admin-error": adminErr, "zones-state": zonesState, "zone-created": zoneCreated, "zone-candidates": zoneCands, "zone-denied": zoneDenied };
     Object.entries(events).forEach(([k, f]) => socket.on(k, f));
     if (socket.connected) { setConnected(true); join(); }
     return () => { Object.entries(events).forEach(([k, f]) => socket.off(k, f)); if (socket.connected) socket.emit("leave-board"); };
@@ -698,7 +805,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   useEffect(() => { document.title = `${boardName} · Whiteboard`; return () => { document.title = "Whiteboard"; }; }, [boardName]);
 
   /* ───────────── Tastatur / Einfügen / Drop ───────────── */
-  fns.current = { undo, redo, copySelection, deleteSelection, duplicateSelection, changeStates, zoomButton, resetView, fitContent, chooseTool, pasteObjects, handleFile, getSelected };
+  fns.current = { focusRect, undo, redo, copySelection, deleteSelection, duplicateSelection, changeStates, zoomButton, resetView, fitContent, chooseTool, pasteObjects, handleFile, getSelected };
   useEffect(() => {
     const F = new Proxy({}, { get: (_, k) => (...a) => fns.current[k](...a) });
     const onKey = e => {
@@ -708,7 +815,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       if (mod) {
         if (k === "z") { e.preventDefault(); e.shiftKey ? F.redo() : F.undo(); }
         else if (k === "y") { e.preventDefault(); F.redo(); }
-        else if (k === "a" && !st.readOnly) { e.preventDefault(); setTool(t => (t === "select" || t === "lasso") ? t : "select"); setSel(st.strokes.map(s => s._id)); }
+        else if (k === "a" && !st.readOnly) { e.preventDefault(); setTool(t => (t === "select" || t === "lasso") ? t : "select"); setSel(st.strokes.filter(canWriteItem).map(s => s._id)); }
         else if (k === "c") { if (F.copySelection()) e.preventDefault(); }
         else if (k === "x" && !st.readOnly) { if (F.copySelection()) { e.preventDefault(); F.deleteSelection(); } }
         else if (k === "d" && !st.readOnly) { e.preventDefault(); F.duplicateSelection(); }
@@ -726,6 +833,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       if (k === "0") { F.resetView(); return; }
       if (k === "f" || k === "9") { F.fitContent(); return; }
       if (k === "?" || k === "/") { setShortcutsOpen(v => !v); return; }
+      if (k === "b" && st.isAdmin && !st.readOnly) { F.chooseTool("zone"); return; }
       const t = TOOL_KEYS[k]; if (t && !(st.readOnly && t !== "hand")) F.chooseTool(t);
     };
     const onKeyUp = e => { if (e.code === "Space") { spaceDown.current = false; stackRef.current?.classList.remove("spaceHeld"); } };
@@ -761,7 +869,9 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
         const r = stackRef.current.getBoundingClientRect(), v = viewRef.current;
         const c = at || { x: (r.width / 2 - v.pan.x) / v.zoom, y: (r.height / 2 - v.pan.y) / v.zoom };
         getImage(data.file.url);
-        addObjects([{ type: "image", src: data.file.url, x: c.x - iw / 2, y: c.y - ih / 2, w: iw, h: ih, rotation: 0 }], { select: true });
+        let w2 = iw, h2 = ih, c2 = c; const wz = S.current.wz;
+        if (wz) { const z = wz.find(q => inRect(q, c)) || wz[0], k2 = Math.min(1, (z.w - 16) / iw, (z.h - 16) / ih); w2 = Math.max(1, Math.round(iw * k2)); h2 = Math.max(1, Math.round(ih * k2)); c2 = { x: clamp(c.x, z.x + w2 / 2 + 4, z.x + z.w - w2 / 2 - 4), y: clamp(c.y, z.y + h2 / 2 + 4, z.y + z.h - h2 / 2 - 4) }; }
+        addObjects([{ type: "image", src: data.file.url, x: c2.x - w2 / 2, y: c2.y - h2 / 2, w: w2, h: h2, rotation: 0 }], { select: true });
         setTool("select");
       } else toast(`„${file.name}“ hochgeladen`, "success", 1800);
     } catch (e) { toast(e.message || "Upload fehlgeschlagen", "error"); } finally { setBusy(false); }
@@ -815,6 +925,34 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const setDeleteOthers = value => { if (isAdmin) { setAllowDeleteOthers(value); socket.emit("set-delete-others", { enabled: value }); } };
   async function kickUser(id) { if (isAdmin && id !== identityId && await askConfirm({ title: "Teilnehmer entfernen?", message: "Die Person wird aus diesem Board geworfen.", confirmLabel: "Entfernen", danger: true })) socket.emit("kick-user", { userId: id }); }
   function toggleViewSync() { if (!isAdmin) return; const next = !viewSyncEnabled; setViewSyncEnabled(next); socket.emit("view-sync-toggle", { boardId, enabled: next, ...sharedViewPayload() }); toast(next ? "Alle Teilnehmer folgen jetzt deiner Ansicht." : "Ansicht-Teilen beendet.", "info", 2200); }
+  /* ───────────── Bereiche (Admin) ───────────── */
+  function zoneCreate(rect, name) { if (!isAdmin) return; socket.emit("zone:create", { x: Math.round(rect.x), y: Math.round(rect.y), w: Math.round(rect.w), h: Math.round(rect.h), ...(name ? { name } : {}) }); }
+  function zoneCreateInView() {
+    const r = stackRef.current.getBoundingClientRect(), v = viewRef.current, w = Math.min(520, r.width * 0.6 / v.zoom), h = w * 0.66;
+    zoneCreate({ x: (r.width / 2 - v.pan.x) / v.zoom - w / 2, y: (r.height / 2 - v.pan.y) / v.zoom - h / 2, w, h });
+  }
+  function zoneUpdate(id, patch) { if (!isAdmin) return; setZones(v => v.map(z => z.id === id ? { ...z, ...patch } : z)); socket.emit("zone:update", { id, patch }); scheduleFrame(); }
+  async function zoneDelete(id) {
+    const z = S.current.zones.find(q => q.id === id); if (!z) return;
+    if (!await askConfirm({ title: `„${z.name}“ löschen?`, message: "Der Bereich verschwindet und alle zugewiesenen Personen verlieren ihre Einschränkung. Die Zeichnungen im Bereich bleiben erhalten.", confirmLabel: "Löschen", danger: true })) return;
+    socket.emit("zone:delete", { id }); if (S.current.selZone === id) setSelZone(null);
+  }
+  function zoneAssign(id, keys, mode) {
+    if (!isAdmin || !keys.length) return;
+    setZones(v => v.map(z => { if (z.id !== id) return z; const as = { ...(z.assignments || {}) }; keys.forEach(k => { if (mode) as[k] = mode; else delete as[k]; }); return { ...z, assignments: as }; }));
+    socket.emit("zone:assign", { id, userIds: keys, mode });
+  }
+  const zoneObjects = z => S.current.strokes.filter(s => boxInRect(z, zoneBox(s)));
+  async function zoneExport(z) {
+    try { setBusy(true); await preloadImages(S.current.strokes); await exportPng(S.current.strokes.filter(s => rectsIntersect(objectBounds(s), z)), S.current.bg, { x: z.x, y: z.y, w: z.w, h: z.h }, `${boardName || "board"}-${z.name}`, 2); toast("Bereich als PNG exportiert", "success", 1700); }
+    catch (e) { toast(e.message || "Export fehlgeschlagen", "error"); } finally { setBusy(false); }
+  }
+  async function zoneClear(z) {
+    const list = zoneObjects(z); if (!list.length) return;
+    if (!await askConfirm({ title: `Inhalt von „${z.name}“ leeren?`, message: `${list.length} Objekt${list.length === 1 ? "" : "e"} werden entfernt. Mit Rückgängig kannst du das wiederherstellen.`, confirmLabel: "Leeren", danger: true })) return;
+    removeObjects(list);
+  }
+  function openZonePanel() { setZonePanel(v => !v); socket.emit("zone:candidates"); }
   function recolorSelection(c) { const sel = getSelected().filter(s => s.type !== "image"); if (sel.length) changeStates(sel, s => ({ ...s, color: c })); }
 
   /* ───────────── Darstellung ───────────── */
@@ -824,9 +962,12 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     return { left: cx, top: top - 64 > 70 ? top - 64 : bottom + 18 };
   })() : null;
   const others = participants.filter(p => p.userId !== identityId);
+  const zoneCounts = useMemo(() => { if (!isAdmin || !zonePanel) return {}; const out = {}; for (const z of zones) out[z.id] = strokes.reduce((n, s) => n + (boxInRect(z, zoneBox(s)) ? 1 : 0), 0); return out; }, [zones, strokes, zonePanel, isAdmin]);
+  const myZones = zoneScope.restricted ? zones : [];
+  const myZoneInfo = zoneScope.restricted ? (zoneScope.writableIds.length ? (zoneScope.seeAll ? "open" : "focus") : "view") : null;
   const showProps = !readOnly && DRAW_TOOLS.has(tool);
   const toolLabel = TOOLS.find(t => t.id === tool)?.label;
-  const hint = readOnly ? "Nur Ansicht – du kannst dich frei im Board bewegen." : viewLocked ? "Der Admin steuert gerade die Ansicht." : tool === "hand" ? "Ziehen zum Verschieben · Mausrad zum Zoomen" : pencilMode ? "Stift zeichnet · Finger verschiebt & zoomt" : `${toolLabel} · Leertaste halten zum Verschieben · Mausrad zoomt`;
+  const hint = zoneRO && !serverRO ? "Nur lesen – du siehst nur deinen Bereich." : readOnly ? "Nur Ansicht – du kannst dich frei im Board bewegen." : tool === "zone" ? "Bereich aufziehen · Bereich anklicken zum Verschieben · Ecken ziehen zum Skalieren" : zoneScope.restricted ? "Du darfst nur in deinem Bereich schreiben · Leertaste halten zum Verschieben"  : viewLocked ? "Der Admin steuert gerade die Ansicht." : tool === "hand" ? "Ziehen zum Verschieben · Mausrad zum Zoomen" : pencilMode ? "Stift zeichnet · Finger verschiebt & zoomt" : `${toolLabel} · Leertaste halten zum Verschieben · Mausrad zoomt`;
   const guestBadge = isGuest ? (guest.guest.mode === "view-only" ? "Gast · Ansicht" : "Gast · Bearbeiten") : null;
 
   return <main className="boardApp" data-theme-dark={isDarkColor(bg.color) ? "1" : "0"} onDragOver={e => { if (!readOnly && e.dataTransfer?.types?.includes("Files")) { e.preventDefault(); setDropActive(true); } }} onDragLeave={e => { if (e.currentTarget === e.target) setDropActive(false); }} onDrop={onDrop}>
@@ -862,6 +1003,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
           </button>
           {popover === "people" && <ParticipantsPanel participants={participants} currentId={identityId} selfName={selfName} isAdmin={isAdmin} allowUserDeleteOthers={allowDeleteOthers} setDeleteOthers={setDeleteOthers} setUserReadOnly={setUserReadOnly} setAllReadOnly={setAllReadOnly} kickUser={kickUser} onClose={() => setPopover(null)} />}
         </div>
+        {isAdmin && <button className={`iconButton zonesBtn ${zonePanel ? "active" : ""}`} onClick={openZonePanel} data-tip="Bereiche verwalten" aria-label="Bereiche verwalten"><Icon name="zone" size={19} />{zones.length > 0 && <em className="badge">{zones.length}</em>}</button>}
         {isAdmin && <button className={`iconButton ${viewSyncEnabled ? "active" : ""}`} onClick={toggleViewSync} data-tip={viewSyncEnabled ? "Ansicht-Teilen beenden" : "Meine Ansicht mit allen teilen"}><Icon name="eye" size={19} /></button>}
         {viewLocked && <span className="viewSyncBadge"><Icon name="eye" size={14} /> Admin-Ansicht</span>}
         <div className="popWrap" data-pop>
@@ -878,10 +1020,19 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       </div>
     </header>
 
-    {readOnly && <div className="readOnlyBar"><Icon name="lock" size={15} /> Nur Lesezugriff <span>· Änderungen anderer siehst du live</span></div>}
+    {readOnly && <div className="readOnlyBar"><Icon name="lock" size={15} /> {zoneRO && !serverRO ? "Nur lesen" : "Nur Lesezugriff"} <span>{zoneRO && !serverRO ? "· du siehst nur deinen Bereich, Änderungen siehst du live" : "· Änderungen anderer siehst du live"}</span></div>}
+    {zoneScope.restricted && <div className="zoneChip glass" style={{ "--zc": (writableZones?.[0] || myZones[0])?.color || "#6366f1" }}>
+      <i />
+      <span><b>{myZones.length === 1 ? myZones[0].name : `${myZones.length} Bereiche`}</b><small>{myZoneInfo === "open" ? "Du siehst alles · schreiben nur hier" : myZoneInfo === "focus" ? "Du siehst & schreibst nur hier" : "Nur lesen"}{myZones.some(z => z.locked) ? " · teils gesperrt" : ""}</small></span>
+      <button className="iconButton" data-tip="Zu meinem Bereich springen" aria-label="Zu meinem Bereich springen" onClick={() => focusRect(unionRect((myZoneInfo === "open" ? writableZones : null)?.length ? writableZones : myZones))}><Icon name="target" size={18} /></button>
+    </div>}
+    {isAdmin && zonePanel && <ZonesPanel zones={zones} counts={zoneCounts} candidates={candidates} selectedId={selZone}
+      onSelect={id => { setSelZone(id); const z = zones.find(q => q.id === id); if (z) focusRect(z, 300); }} onCreate={zoneCreateInView} onUpdate={zoneUpdate} onDelete={zoneDelete} onAssign={zoneAssign}
+      onJump={z => focusRect(z)} onExport={zoneExport} onClear={zoneClear} onClose={() => setZonePanel(false)} />}
 
     {!readOnly && <nav className="dock glass" aria-label="Werkzeuge">
       {TOOLS.map((t, i) => t === "sep" ? <i key={i} className="sep" /> : <button key={t.id} className={`dockBtn ${tool === t.id ? "active" : ""}`} data-tip={`${t.label} · ${t.key}`} aria-label={t.label} aria-pressed={tool === t.id} onClick={() => chooseTool(t.id)}><Icon name={t.icon} size={20} /></button>)}
+      {isAdmin && <><i className="sep" /><button className={`dockBtn zoneTool ${tool === "zone" ? "active" : ""}`} data-tip={`${ZONE_TOOL.label} aufziehen · ${ZONE_TOOL.key}`} aria-label={ZONE_TOOL.label} aria-pressed={tool === "zone"} onClick={() => chooseTool("zone")}><Icon name="zone" size={20} /></button></>}
       <i className="sep" />
       <button className="dockBtn" data-tip="Bild oder Datei hochladen" aria-label="Datei hochladen" onClick={() => fileInput.current?.click()}><Icon name="image" size={20} /></button>
       <input ref={fileInput} type="file" hidden accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain" onChange={e => { [...(e.target.files || [])].forEach(f => handleFile(f)); e.target.value = ""; }} />
@@ -903,13 +1054,13 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
 
     <div className="bottomRight">
       <div className="popWrap" data-pop>
-        {popover === "bg" && !readOnly && <div className="bgPop glass">
+        {popover === "bg" && !readOnly && !zoneScope.restricted && <div className="bgPop glass">
           <b>Hintergrund</b>
           <div className="bgGrid">{BGS.map(b => <button key={b[0]} className={`bgChip ${bg.color === b[1] && bg.pattern === b[2] && (b[2] === "none" || Number(bg.size) === b[3]) ? "active" : ""}`} onClick={() => chooseBg(b)}><span className={`bgSample p-${b[2]}`} style={{ background: b[1], color: isDarkColor(b[1]) ? "rgba(255,255,255,.35)" : "rgba(60,72,100,.35)" }} />{b[0]}</button>)}</div>
           <div className="bgRow"><label>Farbe<input type="color" value={bg.color} onChange={e => updateBg({ color: e.target.value })} /></label><label className="grow">Rastergröße<input type="range" min="8" max="60" value={bg.size || 24} style={{ "--fill": `${((bg.size || 24) - 8) / 52 * 100}%` }} onChange={e => updateBg({ size: +e.target.value })} /></label></div>
         </div>}
         <div className="glass pill">
-          {!readOnly && <button className={`iconButton ${popover === "bg" ? "active" : ""}`} onClick={() => setPopover(popover === "bg" ? null : "bg")} data-tip="Hintergrund"><Icon name="palette" size={19} /></button>}
+          {!readOnly && !zoneScope.restricted && <button className={`iconButton ${popover === "bg" ? "active" : ""}`} onClick={() => setPopover(popover === "bg" ? null : "bg")} data-tip="Hintergrund"><Icon name="palette" size={19} /></button>}
           {!readOnly && <button className={`iconButton ${pencilMode ? "active" : ""}`} onClick={() => { cancelAct(); setPencilMode(v => !v); toast(pencilMode ? "Stiftmodus aus – Finger zeichnen wieder." : "Stiftmodus an – nur der Stift zeichnet, Finger verschieben & zoomen.", "info", 2400); }} data-tip="Stiftmodus (iPad)"><Icon name="touch" size={19} /></button>}
           <button className="iconButton" onClick={() => setShortcutsOpen(true)} data-tip="Tastenkürzel · ?"><Icon name="keyboard" size={19} /></button>
         </div>
@@ -929,7 +1080,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     {shareOpen && <GuestShareModal invites={invites} error={shareError} busy={shareBusy} onCreate={createInvite} onRevoke={revokeInvite} onClose={() => setShareOpen(false)} />}
     <Modal open={shortcutsOpen} title="Tastenkürzel & Gesten" onClose={() => setShortcutsOpen(false)} className="shortcutsPanel">
       <div className="shortcutGrid">
-        {[["V", "Auswählen"], ["H", "Ansicht verschieben"], ["L", "Lasso"], ["P", "Stift"], ["M", "Textmarker"], ["E", "Radierer"], ["I", "Linie"], ["A", "Pfeil"], ["R", "Rechteck"], ["O", "Kreis"], ["T", "Text"], ["Strg + Z / Y", "Rückgängig / Wiederholen"], ["Strg + A", "Alles auswählen"], ["Strg + C / V", "Kopieren / Einfügen"], ["Strg + D", "Duplizieren"], ["Entf", "Auswahl löschen"], ["Pfeiltasten", "Auswahl verschieben (Shift = 10 px)"], ["Leertaste + Ziehen", "Ansicht verschieben"], ["Mausrad / Strg + Rad", "Zoomen"], ["+ / − / 0 / F", "Zoom · 100 % · Alles anzeigen"], ["Shift beim Zeichnen", "Gerade Linie / Quadrat / Kreis"], ["Doppelklick auf Text", "Text bearbeiten"], ["2 Finger", "Zoomen & verschieben (Touch)"], ["Bild einfügen", "Strg + V oder Drag & Drop"]].map(([k, d]) => <div key={k}><kbd>{k}</kbd><span>{d}</span></div>)}
+        {[["V", "Auswählen"], ["H", "Ansicht verschieben"], ["L", "Lasso"], ["P", "Stift"], ["M", "Textmarker"], ["E", "Radierer"], ["I", "Linie"], ["A", "Pfeil"], ["R", "Rechteck"], ["O", "Kreis"], ["T", "Text"], ["B", "Bereich aufziehen (Admin)"], ["Strg + Z / Y", "Rückgängig / Wiederholen"], ["Strg + A", "Alles auswählen"], ["Strg + C / V", "Kopieren / Einfügen"], ["Strg + D", "Duplizieren"], ["Entf", "Auswahl löschen"], ["Pfeiltasten", "Auswahl verschieben (Shift = 10 px)"], ["Leertaste + Ziehen", "Ansicht verschieben"], ["Mausrad / Strg + Rad", "Zoomen"], ["+ / − / 0 / F", "Zoom · 100 % · Alles anzeigen"], ["Shift beim Zeichnen", "Gerade Linie / Quadrat / Kreis"], ["Doppelklick auf Text", "Text bearbeiten"], ["2 Finger", "Zoomen & verschieben (Touch)"], ["Bild einfügen", "Strg + V oder Drag & Drop"]].map(([k, d]) => <div key={k}><kbd>{k}</kbd><span>{d}</span></div>)}
       </div>
     </Modal>
     <Modal open={pdfOpen} title="PDF exportieren" onClose={() => !pdfBusy && setPdfOpen(false)} className="pdfExportPanel">

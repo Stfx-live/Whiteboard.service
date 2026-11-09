@@ -234,9 +234,12 @@ function loadBoard(id) {
     if (!b.background || typeof b.background !== "object") b.background = { ...DEFAULT_BACKGROUND };
     if (!Array.isArray(b.guestInvites)) b.guestInvites = [];
     b.timer = normalizeTimer(b.timer);
+    b.zones = normalizeZones(b.zones);
     boards.set(id, b);
   }
-  return boards.get(id);
+  const cached = boards.get(id);
+  if (!Array.isArray(cached.zones)) cached.zones = normalizeZones(cached.zones);
+  return cached;
 }
 function persistBoard(id, board) { writeJsonAtomic(boardFile(id), board); }
 function normalizeBoardSettings(settings) {
@@ -293,8 +296,141 @@ function canAccountAccessBoard(account, board) {
   return access.mode !== "selected" || access.userIds.includes(account.id);
 }
 
-function compactBoardPreview(board) {
-  return (Array.isArray(board.strokes) ? board.strokes.slice(-14) : []).map(item => {
+/* ───────────── Bereiche (Zones) ─────────────
+   Admins ziehen Bereiche auf das Board und weisen Nutzern/Gast-Einladungen Modi zu:
+   open  = sieht alles, schreibt nur im Bereich
+   focus = sieht nur den Bereich, schreibt im Bereich
+   view  = sieht nur den Bereich, nur lesen
+   Die Durchsetzung passiert hier auf dem Server (Filter für Zustand, Live-Events, Vorschau, Uploads). */
+const ZONE_MODES = ["open", "focus", "view"];
+const ZONE_COLORS = ["#6366f1", "#ef4444", "#f59e0b", "#10b981", "#06b6d4", "#ec4899", "#8b5cf6", "#84cc16"];
+const MAX_ZONES = 24;
+function validColor(c) { return /^#[0-9a-fA-F]{6}$/.test(String(c || "")) ? String(c).toLowerCase() : null; }
+function cleanZoneRect(raw, fallback = {}) {
+  const n = (v, d) => Number.isFinite(Number(v)) ? Number(v) : d;
+  const lim = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  return {
+    x: lim(n(raw?.x, fallback.x ?? 0), -100000, 100000),
+    y: lim(n(raw?.y, fallback.y ?? 0), -100000, 100000),
+    w: lim(n(raw?.w, fallback.w ?? 400), 40, 50000),
+    h: lim(n(raw?.h, fallback.h ?? 300), 40, 50000),
+  };
+}
+function normalizeZones(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, MAX_ZONES).map((z, i) => {
+    if (!z || typeof z !== "object") return null;
+    const assignments = {};
+    if (z.assignments && typeof z.assignments === "object") for (const [k, v] of Object.entries(z.assignments)) if (ZONE_MODES.includes(v)) assignments[String(k).slice(0, 80)] = v;
+    return { id: cleanText(z.id) || crypto.randomUUID().slice(0, 8), name: cleanText(z.name, `Bereich ${i + 1}`).slice(0, 40), color: validColor(z.color) || ZONE_COLORS[i % ZONE_COLORS.length], ...cleanZoneRect(z), locked: Boolean(z.locked), assignments, createdAt: Number(z.createdAt) || Date.now() };
+  }).filter(Boolean);
+}
+function itemBox(item) {
+  if (!item || typeof item !== "object") return null;
+  const num = v => Number.isFinite(Number(v)) ? Number(v) : 0;
+  const fromPts = pts => { if (!pts.length) return null; let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity; for (const p of pts) { x1 = Math.min(x1, p.x); y1 = Math.min(y1, p.y); x2 = Math.max(x2, p.x); y2 = Math.max(y2, p.y); } return { x: x1, y: y1, w: x2 - x1, h: y2 - y1 }; };
+  if (item.type === "stroke") return fromPts((Array.isArray(item.points) ? item.points : []).filter(p => p && Number.isFinite(Number(p.x)) && Number.isFinite(Number(p.y))).map(p => ({ x: Number(p.x), y: Number(p.y) })));
+  if (item.type === "line" || item.type === "arrow") return fromPts([{ x: num(item.x1), y: num(item.y1) }, { x: num(item.x2), y: num(item.y2) }]);
+  if (item.type === "rect" || item.type === "circle" || item.type === "image") {
+    const x = num(item.x), y = num(item.y), w = num(item.w), h = num(item.h), r = num(item.rotation);
+    const cx = x + w / 2, cy = y + h / 2, c = Math.cos(r), s = Math.sin(r);
+    return fromPts([[-w / 2, -h / 2], [w / 2, -h / 2], [w / 2, h / 2], [-w / 2, h / 2]].map(([dx, dy]) => ({ x: cx + dx * c - dy * s, y: cy + dx * s + dy * c })));
+  }
+  if (item.type === "text") return { x: num(item.x), y: num(item.y), w: 0, h: 0 };
+  return null;
+}
+const rectContains = (r, b, eps = 1) => b.x >= r.x - eps && b.y >= r.y - eps && b.x + b.w <= r.x + r.w + eps && b.y + b.h <= r.y + r.h + eps;
+const pointInRect = (r, p, eps = 1) => p.x >= r.x - eps && p.y >= r.y - eps && p.x <= r.x + r.w + eps && p.y <= r.y + r.h + eps;
+function scopeKeyFor(account, guest) { return account ? account.id : guest ? `invite:${guest.inviteId}` : null; }
+function computeScope(board, key, isAdmin) {
+  if (isAdmin || !key) return null;
+  const mine = (board.zones || []).filter(z => z.assignments && z.assignments[key]);
+  if (!mine.length) return null;
+  return {
+    key,
+    seeAll: mine.some(z => z.assignments[key] === "open"),
+    zones: mine,
+    writable: mine.filter(z => !z.locked && (z.assignments[key] === "open" || z.assignments[key] === "focus")),
+  };
+}
+function scopeSees(scope, item) {
+  if (!scope || scope.seeAll) return true;
+  const box = itemBox(item); if (!box) return false;
+  return scope.zones.some(z => rectContains(z, box));
+}
+function scopeSeesPoint(scope, p) { return !scope || scope.seeAll || scope.zones.some(z => pointInRect(z, p)); }
+function scopeCanWrite(scope, item) {
+  if (!scope) return true;
+  const box = itemBox(item); if (!box) return false;
+  return scope.writable.some(z => rectContains(z, box));
+}
+// Freihand-Striche werden an die Bereichsgrenze geklemmt, alle anderen Objekte müssen komplett hineinpassen.
+function enforceWrite(scope, item) {
+  if (!scope) return item;
+  if (item.type === "stroke") {
+    const pts = Array.isArray(item.points) ? item.points : []; if (!pts.length) return null;
+    const zone = scope.writable.find(z => pointInRect(z, pts[0]));
+    if (!zone) return null;
+    const cl = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+    return { ...item, points: pts.map(p => ({ ...p, x: cl(Number(p.x), zone.x, zone.x + zone.w), y: cl(Number(p.y), zone.y, zone.y + zone.h) })) };
+  }
+  return scopeCanWrite(scope, item) ? item : null;
+}
+function filterStrokesFor(scope, strokes) { return scope && !scope.seeAll ? strokes.filter(s => scopeSees(scope, s)) : strokes; }
+function zonePublic(z, scope) { return { id: z.id, name: z.name, color: z.color, x: z.x, y: z.y, w: z.w, h: z.h, locked: Boolean(z.locked), ...(scope ? { mode: z.assignments?.[scope.key] || null } : {}) }; }
+function zonesFor(board, scope, admin) {
+  const list = board.zones || [];
+  if (admin) return list.map(z => ({ ...zonePublic(z, null), assignments: { ...z.assignments } }));
+  if (scope && !scope.seeAll) return scope.zones.map(z => zonePublic(z, scope));
+  return list.map(z => zonePublic(z, scope));
+}
+function scopePublic(scope) { return scope ? { restricted: true, seeAll: scope.seeAll, writableIds: scope.writable.map(z => z.id) } : { restricted: false, seeAll: true, writableIds: [] }; }
+function socketScope(socket, board) {
+  if (isHost(socket)) return null;
+  return computeScope(board, scopeKeyFor(currentAccount(socket), currentGuest(socket)), false);
+}
+function socketsOfBoard(id) {
+  const room = io?.sockets.adapter.rooms.get(id); const out = [];
+  if (room) for (const sid of room) { const s = io.sockets.sockets.get(sid); if (s) out.push(s); }
+  return out;
+}
+// Sendet ein Ereignis pro Empfänger; build(scope, socket) liefert Payload oder null (= nicht senden).
+function emitBoard(id, event, build, exceptSocketId = null) {
+  const b = loadBoard(id);
+  for (const s of socketsOfBoard(id)) {
+    if (exceptSocketId && s.id === exceptSocketId) continue;
+    const payload = build(socketScope(s, b), s);
+    if (payload !== null && payload !== undefined) s.emit(event, payload);
+  }
+}
+function emitBoardMulti(id, build, exceptSocketId = null) {
+  const b = loadBoard(id);
+  for (const s of socketsOfBoard(id)) {
+    if (exceptSocketId && s.id === exceptSocketId) continue;
+    for (const [event, payload] of build(socketScope(s, b), s) || []) s.emit(event, payload);
+  }
+}
+function zoneSignature(b, scope, admin) { return JSON.stringify([scopePublic(scope), zonesFor(b, scope, admin)]); }
+function broadcastZones(id) {
+  const b = loadBoard(id);
+  for (const s of socketsOfBoard(id)) {
+    if (isHost(s)) { s.emit("zones-state", { zones: zonesFor(b, null, true) }); continue; }
+    const scope = socketScope(s, b), sig = zoneSignature(b, scope, false);
+    if (s.data.zoneSig === sig) continue;
+    s.emit("board-state", getRoomState(s, id));
+  }
+}
+function zoneCandidates(b) {
+  const out = [...accounts.values()].filter(a => a.role !== "admin" && !a.locked && canAccountAccessBoard(a, b)).map(a => ({ key: a.id, type: "account", name: a.displayName || a.username, username: a.username, avatarUrl: a.avatarPath ? `/uploads/${a.avatarPath}` : null }));
+  for (const i of b.guestInvites || []) {
+    if (i.revokedAt || (i.expiresAt && i.expiresAt < Date.now())) continue;
+    out.push({ key: `invite:${i.id}`, type: "guest", name: `Gast-${i.codeHash ? "Code" : "Link"} · ${i.mode === "view-only" ? "nur ansehen" : "darf zeichnen"}`, username: new Date(i.createdAt || Date.now()).toLocaleString("de-DE", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" }) });
+  }
+  return out;
+}
+
+function compactBoardPreview(board, scope = null) {
+  return (Array.isArray(board.strokes) ? filterStrokesFor(scope, board.strokes).slice(-14) : []).map(item => {
     if (!item || !item.type) return null;
     if (item.type === "stroke") return { type: "stroke", color: item.color || "#111827", width: Math.min(6, Number(item.width) || 2), points: (item.points || []).filter(Boolean).filter((_, i, arr) => i === 0 || i === arr.length - 1 || i % Math.max(1, Math.ceil(arr.length / 14)) === 0).slice(0, 18) };
     if (item.type === "line") return { type:"line", color:item.color||"#111827", width:Math.min(6,Number(item.width)||2), x1:item.x1,y1:item.y1,x2:item.x2,y2:item.y2 };
@@ -308,7 +444,7 @@ function allBoards(sort = 'updated', account = null) {
   const list = fs.readdirSync(BOARDS_DIR).filter(f => f.endsWith(".json")).map(f => {
     const id = path.basename(f, ".json");
     const b = loadBoard(id);
-    return { id: b.id, name: b.name || b.id, members: getParticipants(id).size, updatedAt: b.updatedAt || 0, createdAt: b.createdAt || b.updatedAt || 0, background: b.background || { ...DEFAULT_BACKGROUND }, createdBy: b.createdBy || null, accessMode: normalizeBoardAccess(b.access).mode, folderId: b.folderId || null, preview: compactBoardPreview(b) };
+    return { id: b.id, name: b.name || b.id, members: getParticipants(id).size, updatedAt: b.updatedAt || 0, createdAt: b.createdAt || b.updatedAt || 0, background: b.background || { ...DEFAULT_BACKGROUND }, createdBy: b.createdBy || null, accessMode: normalizeBoardAccess(b.access).mode, folderId: b.folderId || null, preview: compactBoardPreview(b, account ? computeScope(b, account.id, account.role === "admin") : null) };
   }).filter(item => {
     if (!account) return true;
     const b = loadBoard(item.id);
@@ -494,17 +630,21 @@ function getRoomState(socket, boardId) {
   const b = loadBoard(boardId);
   const account = currentAccount(socket);
   const guest = currentGuest(socket);
+  const scope = socketScope(socket, b), admin = Boolean(account?.role === "admin");
+  socket.data.zoneSig = zoneSignature(b, scope, admin);
   const readOnly = guest ? guest.mode === "view-only" : Boolean(account && b.permissions[account.id]?.readOnly);
   return {
-    strokes: b.strokes || [],
+    strokes: filterStrokesFor(scope, b.strokes || []),
     background: b.background || { ...DEFAULT_BACKGROUND },
     hostUserId: b.hostUserId || null,
-    permissions: { readOnly, isHost: Boolean(account?.role === "admin"), guestMode: guest?.mode || null },
+    permissions: { readOnly, isHost: admin, guestMode: guest?.mode || null },
     boardSettings: normalizeBoardSettings(b.settings),
     participants: publicParticipants(boardId),
-    files: Array.isArray(b.files) ? b.files.map(f => ({ ...f, url: `/uploads/${f.path}` })) : [],
+    files: scope ? [] : Array.isArray(b.files) ? b.files.map(f => ({ ...f, url: `/uploads/${f.path}` })) : [],
     timer: timerPayload(boardId),
     viewSync: normalizeViewSync(b.viewSync),
+    zones: zonesFor(b, scope, admin),
+    zoneScope: scopePublic(scope),
   };
 }
 function normalizeStroke(stroke) {
@@ -746,6 +886,8 @@ uploadApp.post("/api/boards/:boardId/files", boardFileUpload.single("file"), (re
   if (!req.file) return res.status(400).json({ error: "Keine erlaubte Datei." });
   const canUpload = principal.kind === "guest" ? guestCanEdit(principal.guest) : (board.permissions[principal.account.id]?.readOnly ? false : true);
   if (!canUpload) return res.status(403).json({ error: "Nur Lesezugriff." });
+  const upScope = computeScope(board, scopeKeyFor(principal.account, principal.guest), principal.account?.role === "admin");
+  if (upScope && !upScope.writable.length) return res.status(403).json({ error: "In deinem Bereich darfst du nichts hochladen." });
   const ownerId = principal.kind === "guest" ? principal.guest.guestId : principal.account.id;
   const file = {
     id: crypto.randomUUID(),
@@ -762,7 +904,7 @@ uploadApp.post("/api/boards/:boardId/files", boardFileUpload.single("file"), (re
   board.updatedAt = Date.now();
   persistBoard(boardId, board);
   audit("board_file_uploaded", { boardId, actor: principal.kind === "guest" ? principal.guest.guestId : principal.account.id, fileId: file.id });
-  io?.to(boardId).emit("file-added", { file: { ...file, url: `/uploads/${file.path}` } });
+  if (io) emitBoard(boardId, "file-added", sc => sc ? null : { file: { ...file, url: `/uploads/${file.path}` } });
   return res.status(201).json({ file: { ...file, url: `/uploads/${file.path}` } });
 });
 
@@ -997,7 +1139,7 @@ async function requestHandler(req, res) {
       const folderId = body.folderId ? safeId(body.folderId) : null;
       if (!canUseFolder(account, folderId)) return json(res, 403, { error: "Dieser Ordner darf nicht verwendet werden." });
       const id = safeId(`${Date.now().toString(36)}-${crypto.randomBytes(4).toString("hex")}`);
-      const now = Date.now(); const b = { id, name, folderId, strokes: [], files: [], background: { ...DEFAULT_BACKGROUND }, updatedAt: now, createdAt: now, hostUserId: getAdmin()?.id || account.id, permissions: {}, settings: { allowUserDeleteOthers: false }, access: { mode: "all", userIds: [] }, createdBy: account.id, guestInvites: [], timer: { status: "idle", durationMs: 5 * 60 * 1000, remainingMs: 5 * 60 * 1000, startedAt: null, endsAt: null, version: 0, updatedAt: now } };
+      const now = Date.now(); const b = { id, name, folderId, strokes: [], files: [], background: { ...DEFAULT_BACKGROUND }, updatedAt: now, createdAt: now, hostUserId: getAdmin()?.id || account.id, permissions: {}, settings: { allowUserDeleteOthers: false }, access: { mode: "all", userIds: [] }, createdBy: account.id, guestInvites: [], zones: [], timer: { status: "idle", durationMs: 5 * 60 * 1000, remainingMs: 5 * 60 * 1000, startedAt: null, endsAt: null, version: 0, updatedAt: now } };
       boards.set(id, b); persistBoard(id, b);
       audit("board_created", { boardId: id, boardName: name, accountId: account.id, username: account.username });
       return json(res, 201, { id, name, members: 0, background: b.background, folderId });
@@ -1040,7 +1182,8 @@ async function requestHandler(req, res) {
     const id = safeId(url.pathname.split("/").pop());
     const b = loadBoard(id);
     if (!canAccountAccessBoard(account, b)) return json(res, 403, { error: "Du hast keinen Zugriff auf dieses Whiteboard.", code: "BOARD_ACCESS_DENIED" });
-    return json(res, 200, { id: b.id, name: b.name, strokes: b.strokes, files: Array.isArray(b.files) ? b.files.map(f => ({ ...f, url: `/uploads/${f.path}` })) : [], background: b.background || { ...DEFAULT_BACKGROUND }, timer: timerPayload(id), hostUserId: b.hostUserId || null, createdBy: b.createdBy || null, createdAt: b.createdAt || null, updatedAt: b.updatedAt || null, folderId: b.folderId || null, access: normalizeBoardAccess(b.access), settings: normalizeBoardSettings(b.settings), viewSync: normalizeViewSync(b.viewSync) });
+    const zs = computeScope(b, account.id, account.role === "admin");
+    return json(res, 200, { id: b.id, name: b.name, strokes: filterStrokesFor(zs, b.strokes), files: zs ? [] : Array.isArray(b.files) ? b.files.map(f => ({ ...f, url: `/uploads/${f.path}` })) : [], background: b.background || { ...DEFAULT_BACKGROUND }, timer: timerPayload(id), hostUserId: b.hostUserId || null, createdBy: b.createdBy || null, createdAt: b.createdAt || null, updatedAt: b.updatedAt || null, folderId: b.folderId || null, access: normalizeBoardAccess(b.access), settings: normalizeBoardSettings(b.settings), viewSync: normalizeViewSync(b.viewSync) });
   }
 
   const boardMatch = url.pathname.match(/^\/api\/boards\/([^/]+)$/);
@@ -1170,7 +1313,7 @@ function registerSocketHandlers() {
     const participantId = account?.id || guest.guestId;
     const room = getParticipants(boardId);
     let participant = room.get(participantId);
-    if (!participant) participant = { participantId, kind: account ? "account" : "guest", accountId: account?.id || null, guestMode: guest?.mode || null, username: account?.username || guest.displayName, displayName: account?.displayName || guest.displayName, sockets: new Set(), joinedAt: Date.now() };
+    if (!participant) participant = { participantId, kind: account ? "account" : "guest", accountId: account?.id || null, guestMode: guest?.mode || null, inviteId: guest?.inviteId || null, username: account?.username || guest.displayName, displayName: account?.displayName || guest.displayName, sockets: new Set(), joinedAt: Date.now() };
     participant.username = account?.username || guest.displayName; participant.displayName = account?.displayName || guest.displayName; participant.guestMode = guest?.mode || participant.guestMode; participant.sockets.add(socket.id);
     room.set(participantId, participant);
     if (account && !b.permissions[account.id]) b.permissions[account.id] = { readOnly: false };
@@ -1185,29 +1328,39 @@ function registerSocketHandlers() {
     const id = safeId(socket.data.boardId || payload?.boardId); if (!id) return;
     const x = Number(payload?.x), y = Number(payload?.y);
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
-    socket.to(id).emit("cursor:move", { userId: socket.data.participantId, username: socket.data.username, x: Math.max(-10000, Math.min(10000, x)), y: Math.max(-10000, Math.min(10000, y)) });
+    const cx = Math.max(-10000, Math.min(10000, x)), cy = Math.max(-10000, Math.min(10000, y));
+    const out = { userId: socket.data.participantId, username: socket.data.username, x: cx, y: cy };
+    emitBoard(id, "cursor:move", sc => scopeSeesPoint(sc, { x: cx, y: cy }) ? out : null, socket.id);
   });
   socket.on("stroke-live", payload => {
-    const id = safeId(socket.data.boardId || payload?.boardId); const stroke = normalizeStroke(payload?.stroke);
+    const id = safeId(socket.data.boardId || payload?.boardId); let stroke = normalizeStroke(payload?.stroke);
     if (!id || !stroke || !canEdit(socket)) return;
-    getLiveStrokes(id).set(stroke._id, socket.id); socket.to(id).emit("stroke-live", { stroke });
+    const own = socketScope(socket, loadBoard(id));
+    if (own) { stroke = enforceWrite(own, stroke); if (!stroke) return; }
+    getLiveStrokes(id).set(stroke._id, socket.id);
+    emitBoard(id, "stroke-live", sc => scopeSees(sc, stroke) ? { stroke } : null, socket.id);
   });
   socket.on("stroke-live-cancel", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId); const strokeId = cleanText(payload?._id); if (!id || !strokeId) return;
     const live = getLiveStrokes(id); if (live.get(strokeId) !== socket.id) return; live.delete(strokeId); socket.to(id).emit("stroke-live-cancel", { _id: strokeId });
   });
   socket.on("stroke-commit", payload => {
-    const id = safeId(socket.data.boardId || payload?.boardId); const stroke = normalizeStroke(payload?.stroke); if (!id || !stroke || !canEdit(socket)) return;
+    const id = safeId(socket.data.boardId || payload?.boardId); let stroke = normalizeStroke(payload?.stroke); if (!id || !stroke || !canEdit(socket)) return;
+    const b = loadBoard(id); const own = socketScope(socket, b);
+    if (own) { const checked = enforceWrite(own, stroke); if (!checked) { socket.emit("zone-denied", { ids: [stroke._id] }); return; } stroke = checked; }
     stroke.ownerId = socket.data.participantId || null;
-    const b = loadBoard(id); getLiveStrokes(id).delete(stroke._id);
+    getLiveStrokes(id).delete(stroke._id);
     if (!b.strokes.some(s => s?._id === stroke._id)) { b.strokes.push(stroke); b.updatedAt = Date.now(); persistBoard(id, b); }
-    io.to(id).emit("stroke-commit", { stroke });
+    emitBoard(id, "stroke-commit", sc => scopeSees(sc, stroke) ? { stroke } : null);
   });
   socket.on("draw-batch", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId); const list = Array.isArray(payload) ? payload : (payload?.strokes || []); if (!id || !list.length || !canEdit(socket)) return;
-    const valid = list.map(normalizeStroke).filter(Boolean).map(item => ({ ...item, ownerId: socket.data.participantId || null })); if (!valid.length) return;
-    const b = loadBoard(id); const seen = new Set(b.strokes.map(s => s?._id)); const fresh = valid.filter(s => !seen.has(s._id)); if (!fresh.length) return;
-    b.strokes.push(...fresh); b.updatedAt = Date.now(); persistBoard(id, b); io.to(id).emit("draw-batch", fresh);
+    let valid = list.map(normalizeStroke).filter(Boolean).map(item => ({ ...item, ownerId: socket.data.participantId || null })); if (!valid.length) return;
+    const b = loadBoard(id); const own = socketScope(socket, b);
+    if (own) { const denied = []; valid = valid.flatMap(it => { const r = enforceWrite(own, it); if (!r) denied.push(it._id); return r ? [r] : []; }); if (denied.length) socket.emit("zone-denied", { ids: denied }); if (!valid.length) return; }
+    const seen = new Set(b.strokes.map(s => s?._id)); const fresh = valid.filter(s => !seen.has(s._id)); if (!fresh.length) return;
+    b.strokes.push(...fresh); b.updatedAt = Date.now(); persistBoard(id, b);
+    emitBoard(id, "draw-batch", sc => { const l = fresh.filter(it => scopeSees(sc, it)); return l.length ? l : null; });
   });
   function serverRotatePoint(point, center, angle) {
     const c = Math.cos(angle), s = Math.sin(angle), dx = point.x - center.x, dy = point.y - center.y;
@@ -1224,21 +1377,28 @@ function registerSocketHandlers() {
   socket.on("transform-objects", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId);
     if (!id || !canEdit(socket)) return;
-    const list = Array.isArray(payload?.transforms) ? payload.transforms : [];
+    let list = Array.isArray(payload?.transforms) ? payload.transforms : [];
     if (!list.length) return;
-    const b = loadBoard(id);
+    const b = loadBoard(id); const own = socketScope(socket, b);
+    if (own) { const byIdAll = new Map(b.strokes.map(s => [s?._id, s])); list = list.filter(t => { const it = byIdAll.get(cleanText(t?.id)); return it && scopeCanWrite(own, it); }); if (!list.length) return; }
     // Preview transforms are ephemeral. They are broadcast but never persisted, avoiding drift.
     if (payload?.preview) {
-      socket.to(id).emit("objects-transformed", { transforms: list.map(t => ({ ...t, state: t.state ? normalizeStroke({ ...t.state, _id: t.id }) : undefined })) });
+      const out = list.map(t => ({ ...t, state: t.state ? normalizeStroke({ ...t.state, _id: t.id }) : undefined }));
+      const itemOf = new Map(b.strokes.map(s => [s?._id, s]));
+      emitBoard(id, "objects-transformed", sc => { const l = sc && !sc.seeAll ? out.filter(t => { const it = itemOf.get(t.id); return it && scopeSees(sc, it); }) : out; return l.length ? { transforms: l } : null; }, socket.id);
       return;
     }
     const byId = new Map(list.map(t => [cleanText(t?.id), t]));
-    const transformed=[];
+    const transformed=[]; const befores=new Map();
     for (const item of b.strokes) {
       const raw=byId.get(item?._id); if(!raw) continue;
+      const snap = JSON.parse(JSON.stringify(item));
+      if (own && !scopeCanWrite(own, snap)) continue;
+      const rollback = () => { Object.keys(item).forEach(k => delete item[k]); Object.assign(item, snap); };
       if (raw.state && typeof raw.state === "object") {
         const next=normalizeStroke({ ...raw.state, _id:item._id, ownerId:item.ownerId });
-        if (next) { Object.keys(item).forEach(k => delete item[k]); Object.assign(item,next); transformed.push({ id:item._id, state:item }); }
+        if (next && own && !scopeCanWrite(own, next)) continue;
+        if (next) { Object.keys(item).forEach(k => delete item[k]); Object.assign(item,next); transformed.push({ id:item._id, state:item }); befores.set(item._id, snap); }
         continue;
       }
       const t={
@@ -1263,18 +1423,28 @@ function registerSocketHandlers() {
         else if (item.type === "text") { item.x=a.x+((Number(item.x)||0)-a.x)*t.sx; item.y=a.y+((Number(item.y)||0)-a.y)*t.sy; item.maxWidth=Math.max(40,(Number(item.maxWidth)||TEXT_DEFAULT_WIDTH)*t.sx); item.fontSize=Math.max(12,Math.min(160,(Number(item.fontSize)||28)*Math.max(.1,(t.sx+t.sy)/2))); }
       }
       if (t.angle && t.center) serverRotateObject(item,t.angle,t.center);
-      transformed.push({ id:item._id, dx:t.dx, dy:t.dy, angle:t.angle, center:t.center, sx:t.sx, sy:t.sy, anchor:t.anchor });
+      if (own && !scopeCanWrite(own, item)) { rollback(); continue; }
+      transformed.push({ id:item._id, dx:t.dx, dy:t.dy, angle:t.angle, center:t.center, sx:t.sx, sy:t.sy, anchor:t.anchor }); befores.set(item._id, snap);
     }
     if (!transformed.length) return;
     b.updatedAt=Date.now(); persistBoard(id,b);
-    socket.to(id).emit("objects-transformed", { transforms: transformed });
+    const itemNow = new Map(b.strokes.map(s => [s?._id, s]));
+    emitBoardMulti(id, sc => {
+      if (!sc || sc.seeAll) return [["objects-transformed", { transforms: transformed }]];
+      const tr = [], add = [], rem = [];
+      for (const rec of transformed) {
+        const before = befores.get(rec.id), after = itemNow.get(rec.id), vb = scopeSees(sc, before), va = scopeSees(sc, after);
+        if (vb && va) tr.push(rec); else if (va) add.push(after); else if (vb) rem.push(rec.id);
+      }
+      return [...(tr.length ? [["objects-transformed", { transforms: tr }]] : []), ...(add.length ? [["draw-batch", add]] : []), ...(rem.length ? [["erase", { ids: rem }]] : [])];
+    }, socket.id);
   });
   socket.on("erase", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId); if (!id || !canEdit(socket)) return;
     const requested = new Set(Array.isArray(payload?.ids) ? payload.ids : []); if (!requested.size) return;
-    const account = currentAccount(socket); const b = loadBoard(id);
+    const account = currentAccount(socket); const b = loadBoard(id); const own = socketScope(socket, b);
     const allowCrossDelete = Boolean(normalizeBoardSettings(b.settings).allowUserDeleteOthers);
-    const ids = new Set(b.strokes.filter(s => requested.has(s._id) && (account?.role === 'admin' || allowCrossDelete || !s.ownerId || s.ownerId === socket.data.participantId || b.hostUserId === account?.id)).map(s => s._id));
+    const ids = new Set(b.strokes.filter(s => requested.has(s._id) && (!own || scopeCanWrite(own, s)) && (account?.role === 'admin' || allowCrossDelete || !s.ownerId || s.ownerId === socket.data.participantId || b.hostUserId === account?.id)).map(s => s._id));
     if (!ids.size) return;
     b.strokes = b.strokes.filter(s => !ids.has(s._id)); b.updatedAt = Date.now(); persistBoard(id, b); io.to(id).emit("erase", { ids: [...ids] });
   });
@@ -1292,6 +1462,7 @@ function registerSocketHandlers() {
   });
   socket.on("set-background", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId); if (!id || !canEdit(socket)) return;
+    if (socketScope(socket, loadBoard(id))) return;
     const raw = payload?.background ?? payload; const background = {
       color: typeof raw?.color === "string" ? raw.color.slice(0, 32) : DEFAULT_BACKGROUND.color,
       pattern: ["none", "grid", "dots", "lines"].includes(raw?.pattern) ? raw.pattern : "none",
@@ -1347,6 +1518,39 @@ function registerSocketHandlers() {
     b.viewSync = { enabled: true, zoom, pan, center, updatedAt: Date.now(), seq: viewSync.seq + 1 };
     persistViewSyncThrottled(id, b);
     socket.to(id).emit("host-view", normalizeViewSync(b.viewSync));
+  });
+  /* ── Bereiche: nur Admins ── */
+  const zoneAdmin = () => { const id = safeId(socket.data.boardId); return id && isHost(socket) ? id : null; };
+  socket.on("zone:candidates", () => { const id = zoneAdmin(); if (!id) return; socket.emit("zone-candidates", { candidates: zoneCandidates(loadBoard(id)) }); });
+  socket.on("zone:create", payload => {
+    const id = zoneAdmin(); if (!id) return; const b = loadBoard(id);
+    if (b.zones.length >= MAX_ZONES) { socket.emit("admin-error", { message: `Maximal ${MAX_ZONES} Bereiche pro Board.` }); return; }
+    const z = { id: crypto.randomUUID().slice(0, 8), name: cleanText(payload?.name, `Bereich ${b.zones.length + 1}`).slice(0, 40), color: validColor(payload?.color) || ZONE_COLORS[b.zones.length % ZONE_COLORS.length], ...cleanZoneRect(payload), locked: false, assignments: {}, createdAt: Date.now() };
+    b.zones.push(z); b.updatedAt = Date.now(); persistBoard(id, b);
+    audit("zone_created", { boardId: id, zoneId: z.id, byAccountId: currentAccount(socket)?.id || null });
+    broadcastZones(id); socket.emit("zone-created", { id: z.id });
+  });
+  socket.on("zone:update", payload => {
+    const id = zoneAdmin(); if (!id) return; const b = loadBoard(id); const z = b.zones.find(x => x.id === cleanText(payload?.id)); if (!z) return;
+    const patch = payload?.patch || {};
+    if (typeof patch.name === "string") z.name = cleanText(patch.name, z.name).slice(0, 40);
+    if (validColor(patch.color)) z.color = validColor(patch.color);
+    if (typeof patch.locked === "boolean") z.locked = patch.locked;
+    if (["x", "y", "w", "h"].some(k => k in patch)) Object.assign(z, cleanZoneRect(patch, z));
+    b.updatedAt = Date.now(); persistBoard(id, b); broadcastZones(id);
+  });
+  socket.on("zone:delete", payload => {
+    const id = zoneAdmin(); if (!id) return; const b = loadBoard(id); const before = b.zones.length;
+    b.zones = b.zones.filter(x => x.id !== cleanText(payload?.id)); if (b.zones.length === before) return;
+    b.updatedAt = Date.now(); persistBoard(id, b); audit("zone_deleted", { boardId: id, zoneId: payload?.id }); broadcastZones(id);
+  });
+  socket.on("zone:assign", payload => {
+    const id = zoneAdmin(); if (!id) return; const b = loadBoard(id); const z = b.zones.find(x => x.id === cleanText(payload?.id)); if (!z) return;
+    const mode = ZONE_MODES.includes(payload?.mode) ? payload.mode : null;
+    const keys = (Array.isArray(payload?.userIds) ? payload.userIds : [payload?.userId]).map(k => String(k || "")).filter(Boolean).slice(0, 200);
+    const valid = new Set(zoneCandidates(b).map(c => c.key));
+    for (const k of keys) { if (!valid.has(k)) continue; if (mode) z.assignments[k] = mode; else delete z.assignments[k]; }
+    b.updatedAt = Date.now(); persistBoard(id, b); audit("zone_assigned", { boardId: id, zoneId: z.id, mode, count: keys.length }); broadcastZones(id);
   });
   socket.on("timer:sync", () => {
     const id = safeId(socket.data.boardId); if (!id) return;

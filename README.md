@@ -58,3 +58,12 @@ Bilddateien werden nicht mehr zusätzlich als Miniatur in der unteren Dateileist
 - Neues Board-Layout: vertikales Dock links, Eigenschaften-Panel daneben; auf Tablet/Handy horizontales Dock unten, Panel automatisch umgeordnet.
 - Textfeld fokussiert sofort (kein Tastendruck geht mehr an Kürzel verloren), Slider mit Füllfarbe.
 - `prefers-reduced-motion` wird respektiert. `dist/` neu gebaut.
+
+## v55 – Bereiche (Zonen)
+Admins ziehen mit dem Werkzeug **Bereich** (Taste `B`) Rechtecke auf dem Board auf und weisen jeder Person (Konto oder Gast-Link) einen Modus zu:
+- **Sieht alles** – sieht das ganze Board, darf aber nur im Bereich schreiben/zeichnen. Der Rest wird abgedunkelt.
+- **Nur Bereich** – sieht ausschließlich den Bereich und darf nur dort schreiben. Inhalte außerhalb werden gar nicht erst an die Person gesendet.
+- **Nur lesen** – sieht nur den Bereich und kann nichts verändern.
+
+Zusätzlich: Namen & Farben, **Sperren** (nur Admin darf schreiben), Verschieben/Skalieren per Ecken, mehrere Bereiche pro Person, Sammel-Zuweisung, Objektzähler, Bereich als PNG exportieren, Bereichsinhalt leeren, „Zu meinem Bereich springen“, automatischer Zoom auf den eigenen Bereich, Live-Änderung der Rechte ohne Neuladen.
+Durchgesetzt wird alles serverseitig (Striche werden an der Grenze abgeschnitten, Objekte außerhalb abgelehnt, Hintergrund für Eingeschränkte gesperrt). Max. 24 Bereiche pro Board.

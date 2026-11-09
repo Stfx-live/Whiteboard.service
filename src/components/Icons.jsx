@@ -59,6 +59,8 @@ const P = {
   pdf: <><path d="M6.5 3.5h7l4.5 4.5v11a1.5 1.5 0 01-1.5 1.5h-10A1.5 1.5 0 014.9 19V5a1.5 1.5 0 011.6-1.5z" /><path d="M13.5 3.5V8H18" /><path d="M8.5 15h1.6a1.2 1.2 0 000-2.4H8.5V17" /></>,
   play: <path d="M8 5.5v13l10.5-6.5z" fill="currentColor" />,
   pause: <><rect x="7" y="5.5" width="3.4" height="13" rx="1" fill="currentColor" /><rect x="13.6" y="5.5" width="3.4" height="13" rx="1" fill="currentColor" /></>,
+  zone: <><rect x="3.5" y="5" width="17" height="14" rx="2.5" strokeDasharray="3.4 2.6" /><path d="M12 9.2v5.6M9.2 12h5.6" /></>,
+  target: <><circle cx="12" cy="12" r="7.5" /><circle cx="12" cy="12" r="2.6" /><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3" /></>,
   reset: <><path d="M4.5 12a7.5 7.5 0 112.4 5.5" /><path d="M4.5 18v-5h5" /></>,
 };
 
