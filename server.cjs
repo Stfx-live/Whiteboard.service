@@ -24,6 +24,38 @@ const DEFAULT_BACKGROUND = { color: "#ffffff", pattern: "grid", size: 24 };
 fs.mkdirSync(BOARDS_DIR, { recursive: true });
 fs.mkdirSync(AVATARS_DIR, { recursive: true });
 fs.mkdirSync(BOARD_FILES_DIR, { recursive: true });
+// "sharp" ist ein NATIVES Paket und komplett optional. Auf manchen CPUs/Systemen stürzt es beim Laden mit "Illegal instruction"
+// (Exit-Code 132) ab – das lässt sich in Node nicht per try/catch abfangen. Darum wird es nur geladen, wenn es installiert ist
+// UND ein Testlauf in einem separaten Prozess erfolgreich war. Ohne sharp läuft alles normal (Bilder werden dann nur im Browser verkleinert).
+let sharpLib = null, sharpTried = false;
+function loadSharp() {
+  if (sharpTried) return sharpLib;
+  sharpTried = true;
+  try {
+    require.resolve("sharp");
+    const probe = require("child_process").spawnSync(process.execPath, ["-e", "require('sharp').versions.sharp"], { timeout: 20000, stdio: "ignore", windowsHide: true });
+    if (probe.status === 0) { sharpLib = require("sharp"); sharpLib.cache({ files: 0, memory: 64 }); sharpLib.concurrency(1); }
+  } catch { sharpLib = null; }
+  return sharpLib;
+}
+const IMG_MAX_SIDE = 2400, IMG_OPT_MIN_BYTES = 350 * 1024;
+// Verkleinert/komprimiert ein Bild (WebP). Gibt { file, size } der neuen Datei zurück oder null (z. B. wenn nicht kleiner).
+async function optimizeImageFile(absPath, { force = false } = {}) {
+  const sharp = loadSharp();
+  if (!sharp) return null;
+  const ext = path.extname(absPath).toLowerCase();
+  if (![".png", ".jpg", ".jpeg", ".webp"].includes(ext)) return null;
+  const before = fs.statSync(absPath).size;
+  const img = sharp(absPath, { failOn: "none", animated: false }), meta = await img.metadata();
+  const big = Math.max(meta.width || 0, meta.height || 0) > IMG_MAX_SIDE;
+  if (!force && !big && before < IMG_OPT_MIN_BYTES) return null;
+  if (ext === ".webp" && !big && before < 3 * 1048576) return null;
+  const out = absPath.replace(/\.[^.]+$/, "") + (ext === ".webp" ? ".opt.webp" : ".webp");
+  await sharp(absPath, { failOn: "none" }).rotate().resize({ width: IMG_MAX_SIDE, height: IMG_MAX_SIDE, fit: "inside", withoutEnlargement: true }).webp({ quality: 82, effort: 4 }).toFile(out);
+  const after = fs.statSync(out).size;
+  if (after >= before && !big) { fs.unlinkSync(out); return null; }
+  return { file: out, size: after, before };
+}
 const sessions = new Map(); // token -> { accountId, createdAt }
 const accounts = new Map(); // accountId -> account
 const boards = new Map();
@@ -143,9 +175,9 @@ function ensureTimerLoop(boardId) {
 }
 function stopTimerLoop(boardId) { const id = safeId(boardId); const handle = timerIntervals.get(id); if (handle) clearInterval(handle); timerIntervals.delete(id); }
 function timerControlAllowed(socket) { return Boolean(currentAccount(socket)?.role === "admin"); }
-function writeJsonAtomic(file, value) {
+function writeJsonAtomic(file, value, pretty = true) {
   const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  fs.writeFileSync(tmp, pretty ? JSON.stringify(value, null, 2) : JSON.stringify(value), { mode: 0o600 });
   fs.renameSync(tmp, file);
 }
 function audit(event, details = {}) {
@@ -241,7 +273,53 @@ function loadBoard(id) {
   if (!Array.isArray(cached.zones)) cached.zones = normalizeZones(cached.zones);
   return cached;
 }
-function persistBoard(id, board) { writeJsonAtomic(boardFile(id), board); }
+// Boards werden kompakt (ohne Einrückung) gespeichert. persistBoard schreibt sofort (für seltene Änderungen),
+// persistBoardSoon bündelt häufige Änderungen (Striche, Verschieben …): höchstens ein asynchroner Schreibvorgang
+// pro Board alle ~0,7 s, spätestens nach 4 s – das Zeichnen blockiert den Server dadurch nicht mehr.
+const PERSIST_DELAY_MS = 700, PERSIST_MAX_MS = 4000;
+const pendingWrites = new Map(); // id -> { timer, firstAt, board, writing, again }
+function persistBoard(id, board) {
+  id = safeId(id);
+  cancelPendingWrite(id);
+  writeJsonAtomic(boardFile(id), board, false);
+}
+function cancelPendingWrite(id) {
+  const st = pendingWrites.get(id);
+  if (st) { clearTimeout(st.timer); st.timer = null; st.again = false; if (!st.writing) pendingWrites.delete(id); else st.board = null; }
+}
+function persistBoardSoon(id, board) {
+  id = safeId(id);
+  let st = pendingWrites.get(id);
+  if (!st) { st = { timer: null, firstAt: 0, board, writing: false, again: false }; pendingWrites.set(id, st); }
+  st.board = board;
+  if (!st.firstAt) st.firstAt = Date.now();
+  clearTimeout(st.timer);
+  st.timer = setTimeout(() => writePendingBoard(id), Math.max(0, Math.min(PERSIST_DELAY_MS, st.firstAt + PERSIST_MAX_MS - Date.now())));
+}
+async function writePendingBoard(id) {
+  const st = pendingWrites.get(id);
+  if (!st || !st.board) return;
+  clearTimeout(st.timer); st.timer = null;
+  if (st.writing) { st.again = true; return; }
+  st.firstAt = 0; st.writing = true;
+  try {
+    const file = boardFile(id), tmp = `${file}.${process.pid}.a.tmp`;
+    await fs.promises.writeFile(tmp, JSON.stringify(st.board), { mode: 0o600 });
+    if (st.board) await fs.promises.rename(tmp, file); else await fs.promises.unlink(tmp).catch(() => {});
+  } catch (e) { console.error("Board konnte nicht gespeichert werden:", e.message); }
+  finally {
+    st.writing = false;
+    if (st.again && st.board) { st.again = false; writePendingBoard(id); } else if (!st.timer) pendingWrites.delete(id);
+  }
+}
+function flushAllBoards() {
+  for (const [id, st] of [...pendingWrites]) {
+    if (st.board && (st.timer || st.again || st.firstAt)) { try { clearTimeout(st.timer); writeJsonAtomic(boardFile(id), st.board, false); } catch (e) { console.error("Flush fehlgeschlagen:", e.message); } }
+  }
+  pendingWrites.clear();
+}
+for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) process.on(sig, () => { flushAllBoards(); process.exit(0); });
+process.on("exit", flushAllBoards);
 function normalizeBoardSettings(settings) {
   const raw = settings && typeof settings === "object" ? settings : {};
   return {
@@ -253,7 +331,7 @@ function persistViewSyncThrottled(boardId, board) {
   if (viewSyncPersistTimers.has(id)) return;
   const handle = setTimeout(() => {
     viewSyncPersistTimers.delete(id);
-    try { persistBoard(id, board); } catch (e) { console.error("viewSync konnte nicht gespeichert werden:", e.message); }
+    try { persistBoardSoon(id, board); } catch (e) { console.error("viewSync konnte nicht gespeichert werden:", e.message); }
   }, 180);
   viewSyncPersistTimers.set(id, handle);
 }
@@ -262,7 +340,7 @@ function flushViewSyncPersistence(boardId, board) {
   const handle = viewSyncPersistTimers.get(id);
   if (handle) clearTimeout(handle);
   viewSyncPersistTimers.delete(id);
-  persistBoard(id, board);
+  persistBoardSoon(id, board);
 }
 function normalizeViewSync(viewSync) {
   if (!viewSync || typeof viewSync !== "object") return { enabled: false, zoom: 1, pan: { x: 0, y: 0 }, center: null, updatedAt: 0, seq: 0 };
@@ -651,6 +729,17 @@ function normalizeStroke(stroke) {
   if (!stroke || typeof stroke !== "object" || !stroke._id) return null;
   if (stroke.type === "stroke" && !Array.isArray(stroke.points)) return null;
   const normalized = { ...stroke, _id: cleanText(stroke._id), type: cleanText(stroke.type) };
+  if (normalized.type === "stroke") { // Punkte auf 0,01 runden, Doppelte entfernen, Länge begrenzen → kleinere Dateien
+    const out = []; let lx = NaN, ly = NaN;
+    for (const pt of stroke.points) {
+      const x = Math.round(Number(pt?.x) * 100) / 100, y = Math.round(Number(pt?.y) * 100) / 100;
+      if (!Number.isFinite(x) || !Number.isFinite(y) || (x === lx && y === ly)) continue;
+      out.push({ x, y }); lx = x; ly = y;
+      if (out.length >= 30000) break;
+    }
+    if (!out.length) return null;
+    normalized.points = out;
+  }
   if (normalized.type === "text") {
     const text = String(normalized.text ?? "").replace(/\r\n/g, "\n").replace(/\r/g, "\n").slice(0, 5000);
     if (!text.trim()) return null;
@@ -757,6 +846,29 @@ async function cliPrompt(label, { hidden = false } = {}) {
     stdin.on("data", onData);
   });
 }
+async function cliOptimizeImages() {
+  if (!loadSharp()) { console.log("Server-seitige Bild-Optimierung ist nicht verfügbar (optionales Paket 'sharp' fehlt oder läuft auf diesem System nicht). Das ist unkritisch: neue Bilder werden schon im Browser verkleinert."); return; }
+  const files = fs.readdirSync(BOARDS_DIR).filter(f => f.endsWith(".json"));
+  const data = files.map(f => ({ f, b: JSON.parse(fs.readFileSync(path.join(BOARDS_DIR, f), "utf8")) }));
+  const map = new Map(); let saved = 0, n = 0;
+  for (const { b } of data) for (const file of Array.isArray(b.files) ? b.files : []) {
+    if (!/^image\/(png|jpeg|webp)$/.test(file.mimeType || "") || !file.path || map.has(file.path)) continue;
+    const abs = path.join(UPLOADS_DIR, file.path);
+    if (!fs.existsSync(abs)) continue;
+    try {
+      const o = await optimizeImageFile(abs);
+      if (o) { map.set(file.path, { rel: path.relative(UPLOADS_DIR, o.file).replace(/\\/g, "/"), size: o.size, before: o.before }); saved += o.before - o.size; n++; console.log(`  ${file.path}: ${(o.before / 1048576).toFixed(2)} MB -> ${(o.size / 1048576).toFixed(2)} MB`); }
+    } catch (e) { console.log(`  übersprungen (${file.path}): ${e.message}`); }
+  }
+  for (const { f, b } of data) {
+    let changed = false;
+    for (const file of Array.isArray(b.files) ? b.files : []) { const m = map.get(file.path); if (m) { file.path = m.rel; file.mimeType = "image/webp"; file.size = m.size; changed = true; } }
+    for (const s of Array.isArray(b.strokes) ? b.strokes : []) if (s?.type === "image" && typeof s.src === "string" && s.src.startsWith("/uploads/")) { const m = map.get(s.src.slice(9)); if (m) { s.src = `/uploads/${m.rel}`; changed = true; } }
+    writeJsonAtomic(path.join(BOARDS_DIR, f), b, false); void changed;
+  }
+  for (const old of map.keys()) { try { fs.unlinkSync(path.join(UPLOADS_DIR, old)); } catch {} }
+  console.log(n ? `Fertig: ${n} Bild(er) optimiert, ${(saved / 1048576).toFixed(1)} MB gespart.` : "Nichts zu optimieren – alle Bilder sind bereits klein genug.");
+}
 async function cliMain(argv) {
   const command = argv[2] || "";
   try {
@@ -771,6 +883,7 @@ async function cliMain(argv) {
       console.log(`Administrator erstellt: ${admin.username}`);
       return true;
     }
+    if (command === "optimize-images") { await cliOptimizeImages(); return true; }
     if (command === "create-user") {
       if (!getAdmin()) throw new Error("Zuerst muss ein Administrator mit 'init-admin' erstellt werden.");
       const username = argv[3] || await cliPrompt("Benutzername: ");
@@ -823,7 +936,8 @@ uploadApp.use((req, res, next) => {
   next();
 });
 uploadApp.use("/uploads", express.static(UPLOADS_DIR, {
-  maxAge: "1h",
+  maxAge: "30d",
+  immutable: true,
   index: false,
   setHeaders(res) {
     res.setHeader("Access-Control-Allow-Origin", "*");
@@ -877,7 +991,7 @@ uploadApp.post("/api/profile/avatar", avatarUpload.single("file"), (req, res) =>
   return res.status(201).json({ account: accountPublic(account) });
 });
 
-uploadApp.post("/api/boards/:boardId/files", boardFileUpload.single("file"), (req, res) => {
+uploadApp.post("/api/boards/:boardId/files", boardFileUpload.single("file"), async (req, res) => {
   const principal = expressPrincipal(req);
   if (!principal) return res.status(401).json({ error: "Nicht angemeldet." });
   const boardId = safeId(req.params.boardId);
@@ -888,6 +1002,12 @@ uploadApp.post("/api/boards/:boardId/files", boardFileUpload.single("file"), (re
   if (!canUpload) return res.status(403).json({ error: "Nur Lesezugriff." });
   const upScope = computeScope(board, scopeKeyFor(principal.account, principal.guest), principal.account?.role === "admin");
   if (upScope && !upScope.writable.length) return res.status(403).json({ error: "In deinem Bereich darfst du nichts hochladen." });
+  if (loadSharp() && String(req.file.mimetype).startsWith("image/") && req.file.mimetype !== "image/gif") {
+    try {
+      const o = await optimizeImageFile(req.file.path);
+      if (o) { try { fs.unlinkSync(req.file.path); } catch {} req.file.path = o.file; req.file.filename = path.basename(o.file); req.file.size = o.size; req.file.mimetype = "image/webp"; }
+    } catch (e) { console.error("Bild konnte nicht optimiert werden:", e.message); }
+  }
   const ownerId = principal.kind === "guest" ? principal.guest.guestId : principal.account.id;
   const file = {
     id: crypto.randomUUID(),
@@ -1217,7 +1337,7 @@ async function requestHandler(req, res) {
     const b = loadBoard(id);
     if (account.role !== "admin" && b.createdBy !== account.id) return json(res, 403, { error: "Keine Berechtigung." });
     boards.delete(id); participants.delete(id); liveStrokes.delete(id); stopTimerLoop(id);
-    try { fs.unlinkSync(boardFile(id)); } catch {}
+    cancelPendingWrite(id); try { fs.unlinkSync(boardFile(id)); } catch {}
     io?.to(id).emit("board-deleted", { boardId: id });
     audit("board_deleted", { boardId: id, accountId: account.id, username: account.username });
     return json(res, 200, { ok: true });
@@ -1271,7 +1391,7 @@ const server = http.createServer((req, res) => { if (req.url.startsWith('/api/pr
 let io;
 function createRealtimeServer() {
   ({ Server } = require("socket.io"));
-  io = new Server(server, { cors: { origin: true, credentials: true }, transports: ["websocket", "polling"], connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000, skipMiddlewares: true } });
+  io = new Server(server, { cors: { origin: true, credentials: true }, transports: ["websocket", "polling"], perMessageDeflate: { threshold: 4096, zlibDeflateOptions: { level: 3 } }, maxHttpBufferSize: 8e6, connectionStateRecovery: { maxDisconnectionDuration: 2 * 60 * 1000, skipMiddlewares: true } });
   io.use((socket, next) => {
     const token = String(socket.handshake.auth?.token || "");
     const account = getAccountByToken(token);
@@ -1338,7 +1458,8 @@ function registerSocketHandlers() {
     const own = socketScope(socket, loadBoard(id));
     if (own) { stroke = enforceWrite(own, stroke); if (!stroke) return; }
     getLiveStrokes(id).set(stroke._id, socket.id);
-    emitBoard(id, "stroke-live", sc => scopeSees(sc, stroke) ? { stroke } : null, socket.id);
+    const append = Boolean(payload?.append);
+    emitBoard(id, "stroke-live", sc => scopeSees(sc, stroke) ? { stroke, append } : null, socket.id);
   });
   socket.on("stroke-live-cancel", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId); const strokeId = cleanText(payload?._id); if (!id || !strokeId) return;
@@ -1350,7 +1471,7 @@ function registerSocketHandlers() {
     if (own) { const checked = enforceWrite(own, stroke); if (!checked) { socket.emit("zone-denied", { ids: [stroke._id] }); return; } stroke = checked; }
     stroke.ownerId = socket.data.participantId || null;
     getLiveStrokes(id).delete(stroke._id);
-    if (!b.strokes.some(s => s?._id === stroke._id)) { b.strokes.push(stroke); b.updatedAt = Date.now(); persistBoard(id, b); }
+    if (!b.strokes.some(s => s?._id === stroke._id)) { b.strokes.push(stroke); b.updatedAt = Date.now(); persistBoardSoon(id, b); }
     emitBoard(id, "stroke-commit", sc => scopeSees(sc, stroke) ? { stroke } : null);
   });
   socket.on("draw-batch", payload => {
@@ -1359,7 +1480,7 @@ function registerSocketHandlers() {
     const b = loadBoard(id); const own = socketScope(socket, b);
     if (own) { const denied = []; valid = valid.flatMap(it => { const r = enforceWrite(own, it); if (!r) denied.push(it._id); return r ? [r] : []; }); if (denied.length) socket.emit("zone-denied", { ids: denied }); if (!valid.length) return; }
     const seen = new Set(b.strokes.map(s => s?._id)); const fresh = valid.filter(s => !seen.has(s._id)); if (!fresh.length) return;
-    b.strokes.push(...fresh); b.updatedAt = Date.now(); persistBoard(id, b);
+    b.strokes.push(...fresh); b.updatedAt = Date.now(); persistBoardSoon(id, b);
     emitBoard(id, "draw-batch", sc => { const l = fresh.filter(it => scopeSees(sc, it)); return l.length ? l : null; });
   });
   function serverRotatePoint(point, center, angle) {
@@ -1427,7 +1548,7 @@ function registerSocketHandlers() {
       transformed.push({ id:item._id, dx:t.dx, dy:t.dy, angle:t.angle, center:t.center, sx:t.sx, sy:t.sy, anchor:t.anchor }); befores.set(item._id, snap);
     }
     if (!transformed.length) return;
-    b.updatedAt=Date.now(); persistBoard(id,b);
+    b.updatedAt=Date.now(); persistBoardSoon(id,b);
     const itemNow = new Map(b.strokes.map(s => [s?._id, s]));
     emitBoardMulti(id, sc => {
       if (!sc || sc.seeAll) return [["objects-transformed", { transforms: transformed }]];
@@ -1446,7 +1567,7 @@ function registerSocketHandlers() {
     const allowCrossDelete = Boolean(normalizeBoardSettings(b.settings).allowUserDeleteOthers);
     const ids = new Set(b.strokes.filter(s => requested.has(s._id) && (!own || scopeCanWrite(own, s)) && (account?.role === 'admin' || allowCrossDelete || !s.ownerId || s.ownerId === socket.data.participantId || b.hostUserId === account?.id)).map(s => s._id));
     if (!ids.size) return;
-    b.strokes = b.strokes.filter(s => !ids.has(s._id)); b.updatedAt = Date.now(); persistBoard(id, b); io.to(id).emit("erase", { ids: [...ids] });
+    b.strokes = b.strokes.filter(s => !ids.has(s._id)); b.updatedAt = Date.now(); persistBoardSoon(id, b); io.to(id).emit("erase", { ids: [...ids] });
   });
   socket.on("set-delete-others", payload => {
     const id = safeId(socket.data.boardId); if (!id || !isHost(socket)) return;
@@ -1458,7 +1579,7 @@ function registerSocketHandlers() {
   });
   socket.on("clear-board", raw => {
     const id = safeId(socket.data.boardId || (typeof raw === "string" ? raw : raw?.boardId)); if (!id || !canEdit(socket) || !isHost(socket)) return;
-    const b = loadBoard(id); b.strokes = []; b.updatedAt = Date.now(); persistBoard(id, b); io.to(id).emit("clear-board");
+    const b = loadBoard(id); b.strokes = []; b.updatedAt = Date.now(); persistBoardSoon(id, b); io.to(id).emit("clear-board");
   });
   socket.on("set-background", payload => {
     const id = safeId(socket.data.boardId || payload?.boardId); if (!id || !canEdit(socket)) return;

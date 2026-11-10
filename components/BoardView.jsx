@@ -8,13 +8,14 @@ import { toast, askConfirm } from "./Toast";
 import { API, api, upload, uid } from "../lib/api";
 import {
   ZOOM_MIN, ZOOM_MAX, TEXT_MAX_LENGTH, TEXT_DEFAULT_WIDTH, TEXT_BASELINE, FONT_STACK, colorFromId, hitObject, hitPoint, isLine,
-  objectBounds, selectedBounds, shiftObject, rotateObject, scaleObject, bboxInLasso, rectsIntersect,
-} from "../lib/geometry";
+  objectBounds, selectedBounds, shiftObject, rotateObject, scaleObject, bboxInLasso, rectsIntersect, simplifyPoints, compressImageFile } from "../lib/geometry";
 import { drawObject, drawBackground, drawSelection, strokePath, preloadImages, isDarkColor, getImage } from "../lib/render";
 import { createHistory, pushHistory, undoHistory, redoHistory } from "../lib/undoRedo";
 import { contentBounds, exportPng, exportJson, buildPdf, renderExportCanvas } from "../lib/export";
 import { inRect, boxInRect, clampTo, zoneBox, unionRect, drawZoneFills, drawZoneFrames, ZONE_MODES } from "../lib/zones";
 import ZonesPanel from "./ZonesPanel";
+import DiagramPanel from "./DiagramPanel";
+import { buildDiagram, cleanConfig, DEFAULT_DIAGRAM, snapToGrid } from "../lib/diagram";
 
 const DEFAULT_BG = { color: "#ffffff", pattern: "grid", size: 24 };
 const TOOLS = [
@@ -31,6 +32,7 @@ const TOOLS = [
   { id: "rect", icon: "rect", label: "Rechteck", key: "R" },
   { id: "circle", icon: "circle", label: "Kreis", key: "O" },
   { id: "text", icon: "text", label: "Text", key: "T" },
+  { id: "diagram", icon: "chart", label: "Diagramm & Tabelle", key: "D" },
 ];
 const TOOL_KEYS = Object.fromEntries(TOOLS.filter(t => t !== "sep").map(t => [t.key.toLowerCase(), t.id]));
 const COLORS = ["#111827", "#ef4444", "#f97316", "#eab308", "#22c55e", "#06b6d4", "#3b82f6", "#8b5cf6", "#ec4899", "#ffffff"];
@@ -95,6 +97,10 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const [view, setViewState] = useState({ zoom: 1, pan: { x: 0, y: 0 } });
   const [participants, setParticipants] = useState([]);
   const [serverRO, setReadOnly] = useState(isGuest && guest?.guest?.mode === "view-only");
+  const [propsHidden, setPropsHidden] = useState(false);
+  const [diagCfg, setDiagCfg] = useState(() => { try { return { ...DEFAULT_DIAGRAM, ...JSON.parse(localStorage.getItem("wb-diagram") || "{}") }; } catch { return DEFAULT_DIAGRAM; } });
+  const diagPrev = useRef({ key: "", items: [] });
+  useEffect(() => { try { localStorage.setItem("wb-diagram", JSON.stringify(diagCfg)); } catch {} }, [diagCfg]);
   const [zones, setZones] = useState([]);
   const [zoneScope, setZoneScope] = useState(NO_SCOPE);
   const [selZone, setSelZoneState] = useState(null);
@@ -129,7 +135,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const clipboard = useRef([]), pasteCount = useRef(0), localClear = useRef(false);
   const selectedRef = useRef([]), textEditRef = useRef(null), liveTimer = useRef(null);
   const cursors = useCursorStore();
-  const zoneOv = useRef(null), zoneToastAt = useRef(0), zoneSigRef = useRef("");
+  const baseState = useRef({ key: null, arr: null }), zoneOv = useRef(null), zoneToastAt = useRef(0), zoneSigRef = useRef("");
   const zoneRO = zoneScope.restricted && zoneScope.writableIds.length === 0;
   const readOnly = serverRO || zoneRO;
   const writableZones = zoneScope.restricted ? zones.filter(z => zoneScope.writableIds.includes(z.id)) : null;
@@ -142,7 +148,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
 
   // Aktueller Stand für Event-Handler (wird bei jedem Render aktualisiert → keine veralteten Closures).
   const S = useRef({});
-  S.current = { strokes, bg, tool, color, width, fill, pencilMode, readOnly, serverRO, zones, zoneScope, wz: writableZones, selZone, viewLocked, isAdmin, allowDeleteOthers, identityId, viewSyncEnabled, selectedIds, hiddenId: textEdit?.id || null, theme };
+  S.current = { diagCfg, strokes, bg, tool, color, width, fill, pencilMode, readOnly, serverRO, zones, zoneScope, wz: writableZones, selZone, viewLocked, isAdmin, allowDeleteOthers, identityId, viewSyncEnabled, selectedIds, hiddenId: textEdit?.id || null, theme };
 
   /* ───────────── Zeichenfläche: Frame-Rendering ───────────── */
   function scheduleFrame() { if (frame.current) return; frame.current = requestAnimationFrame(renderFrame); }
@@ -158,33 +164,56 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     for (const c of [base, ov]) { const cw = Math.round(w * d), ch = Math.round(h * d); if (c.width !== cw || c.height !== ch) { c.width = cw; c.height = ch; } }
     const v = viewRef.current, st = S.current, over = override.current;
     const x = base.getContext("2d");
-    x.setTransform(d, 0, 0, d, 0, 0);
-    x.fillStyle = st.bg.color; x.fillRect(0, 0, w, h);
-    x.save(); x.translate(v.pan.x, v.pan.y); x.scale(v.zoom, v.zoom);
     const m = 8 / v.zoom;
     const vr = { left: -v.pan.x / v.zoom, top: -v.pan.y / v.zoom, right: (w - v.pan.x) / v.zoom, bottom: (h - v.pan.y) / v.zoom, zoom: v.zoom };
-    drawBackground(x, st.bg, vr);
     const zov = zoneOv.current, zl = st.zones.length ? (zov ? st.zones.map(z => z.id === zov.id ? { ...z, ...zov.rect } : z) : st.zones) : st.zones;
-    if (zl.length) drawZoneFills(x, zl);
-    const visible = s => { const b = objectBounds(s); return !b || !(b.x - m > vr.right || b.x + b.w + m < vr.left || b.y - m > vr.bottom || b.y + b.h + m < vr.top); };
-    for (const s0 of st.strokes) {
-      if (s0._id === st.hiddenId) continue;
-      const s = over.size ? (over.get(s0._id) || s0) : s0;
-      if (visible(s)) drawObject(x, s, { onImageLoad: scheduleFrame });
+    // Basis-Ebene (Hintergrund + Objekte) wird nur neu gezeichnet, wenn sich Ansicht/Objekte ändern; neue Striche werden
+    // einfach oben drauf gezeichnet. Cursor, Live-Striche anderer, Auswahl & Bereichsrahmen liegen auf der Overlay-Ebene.
+    const bs = baseState.current, arr = st.strokes;
+    const zsig = zl.length ? zl.map(z => `${z.id}${z.x},${z.y},${z.w},${z.h},${z.color}`).join(";") : "";
+    const key = `${w}|${h}|${d}|${v.pan.x}|${v.pan.y}|${v.zoom}|${st.bg.color}|${st.bg.pattern}|${st.bg.size}|${zsig}|${st.hiddenId || ""}`;
+    let mode = "full";
+    if (!over.size && bs.key === key && bs.arr) {
+      if (bs.arr === arr) mode = "none";
+      else if (arr.length > bs.arr.length) { mode = "append"; for (let i = 0; i < bs.arr.length; i++) if (arr[i] !== bs.arr[i]) { mode = "full"; break; } }
     }
-    remoteLive.current.forEach(s => drawObject(x, s));
-    if (st.zoneScope.restricted) { // Außerhalb der erlaubten Bereiche abdunkeln
-      const keep = st.zoneScope.seeAll ? zl.filter(z => st.zoneScope.writableIds.includes(z.id)) : zl;
-      x.save(); x.beginPath(); x.rect(vr.left - 20, vr.top - 20, vr.right - vr.left + 40, vr.bottom - vr.top + 40);
-      keep.forEach(z => x.rect(z.x, z.y, z.w, z.h));
-      if (st.zoneScope.seeAll) { x.globalAlpha = 0.24; x.fillStyle = isDarkColor(st.bg.color) ? "#000" : "#334155"; } else { x.globalAlpha = 0.94; x.fillStyle = st.bg.color; }
-      x.fill("evenodd"); x.restore();
+    if (mode !== "none") {
+      x.setTransform(d, 0, 0, d, 0, 0);
+      if (mode === "full") { x.fillStyle = st.bg.color; x.fillRect(0, 0, w, h); }
+      x.save(); x.translate(v.pan.x, v.pan.y); x.scale(v.zoom, v.zoom);
+      if (mode === "full") { drawBackground(x, st.bg, vr); if (zl.length) drawZoneFills(x, zl); }
+      const onImg = () => { baseState.current.key = null; scheduleFrame(); };
+      const visible = s => { const b = objectBounds(s); return !b || !(b.x - m > vr.right || b.x + b.w + m < vr.left || b.y - m > vr.bottom || b.y + b.h + m < vr.top || (s.type !== "image" && Math.max(b.w, b.h) * v.zoom < 0.9)); };
+      for (let i = mode === "append" ? bs.arr.length : 0; i < arr.length; i++) {
+        const s0 = arr[i];
+        if (s0._id === st.hiddenId) continue;
+        const s = over.size ? (over.get(s0._id) || s0) : s0;
+        if (visible(s)) drawObject(x, s, { onImageLoad: onImg });
+      }
+      x.restore();
+      bs.key = over.size ? null : key; bs.arr = over.size ? null : arr;
     }
-    if (zl.length) drawZoneFrames(x, zl, v.zoom, st.isAdmin ? st.selZone : null);
-    x.restore();
 
     const o = ov.getContext("2d");
     o.setTransform(d, 0, 0, d, 0, 0); o.clearRect(0, 0, w, h);
+    o.save(); o.translate(v.pan.x, v.pan.y); o.scale(v.zoom, v.zoom);
+    remoteLive.current.forEach(s => drawObject(o, s));
+    if (st.zoneScope.restricted) { // Außerhalb der erlaubten Bereiche abdunkeln
+      const keep = st.zoneScope.seeAll ? zl.filter(z => st.zoneScope.writableIds.includes(z.id)) : zl;
+      o.save(); o.beginPath(); o.rect(vr.left - 20, vr.top - 20, vr.right - vr.left + 40, vr.bottom - vr.top + 40);
+      keep.forEach(z => o.rect(z.x, z.y, z.w, z.h));
+      if (st.zoneScope.seeAll) { o.globalAlpha = 0.24; o.fillStyle = isDarkColor(st.bg.color) ? "#000" : "#334155"; } else { o.globalAlpha = 0.94; o.fillStyle = st.bg.color; }
+      o.fill("evenodd"); o.restore();
+    }
+    if (zl.length) drawZoneFrames(o, zl, v.zoom, st.isAdmin ? st.selZone : null);
+    if (st.tool === "diagram" && !st.readOnly && hover.current && !act.current) { // Vorschau des Diagramms am Mauszeiger
+      const bgs = Math.max(4, Number(st.bg.size) || 24), key = JSON.stringify([st.diagCfg, bgs, st.color]);
+      if (diagPrev.current.key !== key) diagPrev.current = { key, items: buildDiagram(st.diagCfg, 0, 0, bgs, st.color) };
+      const ox = snapToGrid(hover.current.x, bgs), oy = snapToGrid(hover.current.y, bgs);
+      o.save(); o.translate(ox, oy); o.globalAlpha = 0.55; for (const it of diagPrev.current.items) drawObject(o, it); o.restore();
+      o.save(); o.fillStyle = "#6366f1"; o.beginPath(); o.arc(ox, oy, 5 / v.zoom, 0, Math.PI * 2); o.fill(); o.restore();
+    }
+    o.restore();
     const a = act.current;
     if (selectedRef.current.length && !(a && (a.kind === "lasso" || a.kind === "marquee"))) {
       const ids = new Set(selectedRef.current);
@@ -524,6 +553,14 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     if (panning) { if (!st.viewLocked) startPan(e); return; }
     const p = point(e), touch = e.pointerType === "touch";
     switch (st.tool) {
+      case "diagram": {
+        const bgs = Math.max(4, Number(st.bg.size) || 24), sx = snapToGrid(p.x, bgs), sy = snapToGrid(p.y, bgs);
+        const items = buildDiagram(st.diagCfg, sx, sy, bgs, st.color);
+        if (!items.length) { toast("Es gibt noch nichts zu zeichnen – prüfe die Einstellungen.", "info", 2200); return; }
+        if (st.wz && items.some(it => !canWriteItem(it))) { denyZone("Das Diagramm passt hier nicht komplett in deinen Bereich."); return; }
+        addObjects(items, { select: true }); setTool("select"); hover.current = null;
+        toast(`${items.length} Objekte eingefügt – zum Verschieben ausgewählt`, "success", 2000); return;
+      }
       case "zone": {
         if (!st.isAdmin) return;
         try { overlayRef.current.setPointerCapture(e.pointerId); } catch {}
@@ -587,7 +624,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       hover.current = p;
       const now = performance.now();
       if (socket.connected && now - cursorSent.current >= 40) { cursorSent.current = now; socket.emit("cursor:move", { boardId, x: p.x, y: p.y }); }
-      if (S.current.tool === "eraser" && !act.current) scheduleFrame();
+      if ((S.current.tool === "eraser" || S.current.tool === "diagram") && !act.current) scheduleFrame();
     }
     const a = act.current;
     if (!a) return;
@@ -639,7 +676,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       clearTimeout(liveTimer.current); liveTimer.current = null;
       const pe = a.zone ? clampTo(a.zone, p) : p, last = a.pts[a.pts.length - 1]; if (Math.hypot(pe.x - last.x, pe.y - last.y) > 0.5 / viewRef.current.zoom) a.pts.push(pe);
       const marker = a.tool === "marker";
-      const item = { _id: a.id, type: "stroke", points: a.pts, color: st.color, width: marker ? markerWidth(st.width) : st.width, ...(marker ? { alpha: 0.38 } : {}) };
+      const item = { _id: a.id, type: "stroke", points: simplifyPoints(a.pts, 0.3), color: st.color, width: marker ? markerWidth(st.width) : st.width, ...(marker ? { alpha: 0.38 } : {}) };
       addObjects([item], { event: "stroke-commit" });
     } else if (a.kind === "shape") {
       a.p = a.zone ? clampTo(a.zone, p) : p; a.shift = e.shiftKey; const sh = buildShape(a); if (sh) addObjects([sh]);
@@ -699,6 +736,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
 
   // Neu zeichnen, sobald sich sichtbarer Zustand ändert.
   useEffect(() => { scheduleFrame(); }, [strokes, bg, selectedIds, textEdit?.id, theme, tool, color, width, zones, zoneScope, selZone]);
+  useEffect(() => { setPropsHidden(false); }, [tool]);
   useEffect(() => { if (selZone && !zones.some(z => z.id === selZone)) setSelZoneState(null); }, [zones, selZone]);
   useEffect(() => { if (zonePanel && isAdmin) socket.emit("zone:candidates"); }, [zonePanel, zones.length]);
   useEffect(() => { if (zoneRO && (tool !== "hand")) { cancelAct(); } }, [zoneRO]);
@@ -811,6 +849,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     const onKey = e => {
       if (isTyping(e.target) || e.target.closest?.(".modalPanel")) return;
       const mod = e.ctrlKey || e.metaKey, k = e.key.toLowerCase(), st = S.current;
+      if (e.key === "Escape" && (st.tool === "diagram" || st.tool === "zone")) { F.chooseTool("select"); return; }
       if (e.code === "Space") { if (!spaceDown.current) { spaceDown.current = true; stackRef.current?.classList.add("spaceHeld"); } e.preventDefault(); return; }
       if (mod) {
         if (k === "z") { e.preventDefault(); e.shiftKey ? F.redo() : F.undo(); }
@@ -851,6 +890,7 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   }, []);
 
   /* ───────────── Dateien ───────────── */
+  const fmtSize = n => n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`;
   async function handleFile(file, at) {
     if (!file || S.current.readOnly) return;
     const isImg = file.type.startsWith("image/");
@@ -858,10 +898,12 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
     if (file.size > 20 * 1024 * 1024) { toast("Die Datei ist größer als 20 MB.", "error"); return; }
     setBusy(true);
     try {
-      const data = await upload(`/api/boards/${encodeURIComponent(boardId)}/files`, file, token, "file", guest?.token || "");
+      let send = file;
+      if (isImg) { send = await compressImageFile(file); if (send !== file) toast(`Bild komprimiert: ${fmtSize(file.size)} → ${fmtSize(send.size)}`, "info", 2200); }
+      const data = await upload(`/api/boards/${encodeURIComponent(boardId)}/files`, send, token, "file", guest?.token || "");
       setFiles(v => v.some(f => f.id === data.file.id) ? v : [...v, data.file]);
       if (isImg) {
-        const localUrl = URL.createObjectURL(file);
+        const localUrl = URL.createObjectURL(send);
         const dim = await new Promise(res => { const im = new Image(); im.onload = () => res({ w: im.naturalWidth || 400, h: im.naturalHeight || 300 }); im.onerror = () => res(null); im.src = localUrl; });
         URL.revokeObjectURL(localUrl);
         if (!dim) throw new Error("Das Bild konnte nicht gelesen werden.");
@@ -965,9 +1007,9 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
   const zoneCounts = useMemo(() => { if (!isAdmin || !zonePanel) return {}; const out = {}; for (const z of zones) out[z.id] = strokes.reduce((n, s) => n + (boxInRect(z, zoneBox(s)) ? 1 : 0), 0); return out; }, [zones, strokes, zonePanel, isAdmin]);
   const myZones = zoneScope.restricted ? zones : [];
   const myZoneInfo = zoneScope.restricted ? (zoneScope.writableIds.length ? (zoneScope.seeAll ? "open" : "focus") : "view") : null;
-  const showProps = !readOnly && DRAW_TOOLS.has(tool);
+  const showProps = !readOnly && DRAW_TOOLS.has(tool) && !propsHidden;
   const toolLabel = TOOLS.find(t => t.id === tool)?.label;
-  const hint = zoneRO && !serverRO ? "Nur lesen – du siehst nur deinen Bereich." : readOnly ? "Nur Ansicht – du kannst dich frei im Board bewegen." : tool === "zone" ? "Bereich aufziehen · Bereich anklicken zum Verschieben · Ecken ziehen zum Skalieren" : zoneScope.restricted ? "Du darfst nur in deinem Bereich schreiben · Leertaste halten zum Verschieben"  : viewLocked ? "Der Admin steuert gerade die Ansicht." : tool === "hand" ? "Ziehen zum Verschieben · Mausrad zum Zoomen" : pencilMode ? "Stift zeichnet · Finger verschiebt & zoomt" : `${toolLabel} · Leertaste halten zum Verschieben · Mausrad zoomt`;
+  const hint = zoneRO && !serverRO ? "Nur lesen – du siehst nur deinen Bereich." : readOnly ? "Nur Ansicht – du kannst dich frei im Board bewegen." : tool === "diagram" ? "Diagramm: Einstellungen links, dann Punkt auf dem Board anklicken · Esc bricht ab" : tool === "zone" ? "Bereich aufziehen · Bereich anklicken zum Verschieben · Ecken ziehen zum Skalieren" : zoneScope.restricted ? "Du darfst nur in deinem Bereich schreiben · Leertaste halten zum Verschieben"  : viewLocked ? "Der Admin steuert gerade die Ansicht." : tool === "hand" ? "Ziehen zum Verschieben · Mausrad zum Zoomen" : pencilMode ? "Stift zeichnet · Finger verschiebt & zoomt" : `${toolLabel} · Leertaste halten zum Verschieben · Mausrad zoomt`;
   const guestBadge = isGuest ? (guest.guest.mode === "view-only" ? "Gast · Ansicht" : "Gast · Bearbeiten") : null;
 
   return <main className="boardApp" data-theme-dark={isDarkColor(bg.color) ? "1" : "0"} onDragOver={e => { if (!readOnly && e.dataTransfer?.types?.includes("Files")) { e.preventDefault(); setDropActive(true); } }} onDragLeave={e => { if (e.currentTarget === e.target) setDropActive(false); }} onDrop={onDrop}>
@@ -1031,13 +1073,14 @@ export default function BoardView({ socket, board: boardProp, account, guest, to
       onJump={z => focusRect(z)} onExport={zoneExport} onClear={zoneClear} onClose={() => setZonePanel(false)} />}
 
     {!readOnly && <nav className="dock glass" aria-label="Werkzeuge">
-      {TOOLS.map((t, i) => t === "sep" ? <i key={i} className="sep" /> : <button key={t.id} className={`dockBtn ${tool === t.id ? "active" : ""}`} data-tip={`${t.label} · ${t.key}`} aria-label={t.label} aria-pressed={tool === t.id} onClick={() => chooseTool(t.id)}><Icon name={t.icon} size={20} /></button>)}
+      {TOOLS.map((t, i) => t === "sep" ? <i key={i} className="sep" /> : <button key={t.id} className={`dockBtn ${tool === t.id ? "active" : ""}`} data-tip={`${t.label} · ${t.key}`} aria-label={t.label} aria-pressed={tool === t.id} onClick={() => { if (tool === t.id && (DRAW_TOOLS.has(t.id) || t.id === "diagram")) setPropsHidden(v => !v); else { setPropsHidden(false); chooseTool(t.id); } }}><Icon name={t.icon} size={20} /></button>)}
       {isAdmin && <><i className="sep" /><button className={`dockBtn zoneTool ${tool === "zone" ? "active" : ""}`} data-tip={`${ZONE_TOOL.label} aufziehen · ${ZONE_TOOL.key}`} aria-label={ZONE_TOOL.label} aria-pressed={tool === "zone"} onClick={() => chooseTool("zone")}><Icon name="zone" size={20} /></button></>}
       <i className="sep" />
       <button className="dockBtn" data-tip="Bild oder Datei hochladen" aria-label="Datei hochladen" onClick={() => fileInput.current?.click()}><Icon name="image" size={20} /></button>
       <input ref={fileInput} type="file" hidden accept="image/png,image/jpeg,image/webp,image/gif,application/pdf,text/plain" onChange={e => { [...(e.target.files || [])].forEach(f => handleFile(f)); e.target.value = ""; }} />
     </nav>}
 
+    {tool === "diagram" && !readOnly && !propsHidden && <DiagramPanel cfg={diagCfg} setCfg={setDiagCfg} count={diagPrev.current.items.length} onClose={() => setPropsHidden(true)} />}
     {showProps && <div className="propPanel glass" key={tool}>
       {tool !== "eraser" && <div className="swatches">{COLORS.map(c => <button key={c} className={`swatch ${color.toLowerCase() === c ? "active" : ""} ${c === "#ffffff" ? "white" : ""}`} style={{ background: c }} aria-label={c} onClick={() => setColor(c)} />)}
         <label className={`swatch custom ${COLORS.includes(color.toLowerCase()) ? "" : "active"}`} style={!COLORS.includes(color.toLowerCase()) ? { background: color } : undefined}><input type="color" value={color} onChange={e => setColor(e.target.value)} /><Icon name="plus" size={13} /></label></div>}

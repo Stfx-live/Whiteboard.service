@@ -1,7 +1,7 @@
 {
   "name": "realtime-whiteboard",
   "private": true,
-  "version": "1.0.55",
+  "version": "1.0.57-1",
   "type": "module",
   "scripts": {
     "start": "concurrently --kill-others-on-fail \"node server.cjs\" \"vite --mode production --host 0.0.0.0 --port 8080\"",
@@ -11,18 +11,19 @@
     "user:reset-password": "node server.cjs reset-password",
     "user:unlock": "node server.cjs unlock-user",
     "user:list": "node server.cjs list-users",
-    "dev": "concurrently --kill-others-on-fail \"node dev-server.cjs\" \"vite --mode development --host 0.0.0.0 --port 5173\""
+    "dev": "concurrently --kill-others-on-fail \"node dev-server.cjs\" \"vite --mode development --host 0.0.0.0 --port 5173\"",
+    "optimize": "node server.cjs optimize-images"
   },
   "dependencies": {
     "cors": "^2.8.5",
     "express": "^4.21.2",
+    "jspdf": "^4.2.1",
+    "multer": "^2.1.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "socket.io": "^4.8.1",
     "socket.io-client": "^4.8.1",
-    "vite": "^6.0.5",
-    "multer": "^2.1.1",
-    "jspdf": "^4.2.1"
+    "vite": "^6.0.5"
   },
   "devDependencies": {
     "concurrently": "^9.2.1"

@@ -61,6 +61,7 @@ const P = {
   pause: <><rect x="7" y="5.5" width="3.4" height="13" rx="1" fill="currentColor" /><rect x="13.6" y="5.5" width="3.4" height="13" rx="1" fill="currentColor" /></>,
   zone: <><rect x="3.5" y="5" width="17" height="14" rx="2.5" strokeDasharray="3.4 2.6" /><path d="M12 9.2v5.6M9.2 12h5.6" /></>,
   target: <><circle cx="12" cy="12" r="7.5" /><circle cx="12" cy="12" r="2.6" /><path d="M12 2.5v3M12 18.5v3M2.5 12h3M18.5 12h3" /></>,
+  chart: <><path d="M4.5 4.5v15h15" /><path d="M8.5 15.5l3-4.5 3 2.5 4-6" /><circle cx="8.5" cy="15.5" r=".9" fill="currentColor" /><circle cx="11.5" cy="11" r=".9" fill="currentColor" /><circle cx="14.5" cy="13.5" r=".9" fill="currentColor" /></>,
   reset: <><path d="M4.5 12a7.5 7.5 0 112.4 5.5" /><path d="M4.5 18v-5h5" /></>,
 };
 
